@@ -3,17 +3,24 @@ package repository
 import (
 	"context"
 	"fmt"
+	"time"
+
 	"wb-order-service/internal/models"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"go.opentelemetry.io/otel"
 )
+
+var tracer = otel.Tracer("repository")
 
 // PostgresRepository - хранилище, работающее с PostgreSQL
 type PostgresRepository struct {
-	pool *pgxpool.Pool
+	pool    *pgxpool.Pool
+	timeout time.Duration
 }
 
-func NewPostgresRepository(ctx context.Context, connString string) (*PostgresRepository, error) {
+// NewPostgresRepository создает новое подключение к БД
+func NewPostgresRepository(ctx context.Context, connString string, timeout time.Duration) (*PostgresRepository, error) {
 	pool, err := pgxpool.New(ctx, connString)
 	if err != nil {
 		return nil, fmt.Errorf("unable to connect to database: %w", err)
@@ -25,7 +32,7 @@ func NewPostgresRepository(ctx context.Context, connString string) (*PostgresRep
 		return nil, fmt.Errorf("unable to ping database: %w", err)
 	}
 
-	return &PostgresRepository{pool: pool}, nil
+	return &PostgresRepository{pool: pool, timeout: timeout}, nil
 }
 
 // Close закрывает пул соединений
@@ -33,16 +40,28 @@ func (r *PostgresRepository) Close() {
 	r.pool.Close()
 }
 
-// SaveOrder сохраняет заказ в БД (в транзакции)
+// withTimeout оборачивает контекст таймаутом
+func (r *PostgresRepository) withTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(ctx, r.timeout)
+}
+
+// SaveOrder сохраняет заказ в БД
 func (r *PostgresRepository) SaveOrder(ctx context.Context, order models.Order) error {
+	ctx, span := tracer.Start(ctx, "postgres.SaveOrder")
+	defer span.End()
+
 	//Начинаем транзакцию
+	ctx, cancel := r.withTimeout(ctx)
+	defer cancel()
+
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("begin transaction: %w", err)
 	}
 	// Если произойдет ошибка - откатим все изменения
-	defer tx.Rollback(ctx)
-
+	defer func() {
+		_ = tx.Rollback(context.Background())
+	}()
 	// 1. Вставляем таблицу orders
 	_, err = tx.Exec(ctx, `
 		INSERT INTO orders (
@@ -112,6 +131,12 @@ func (r *PostgresRepository) SaveOrder(ctx context.Context, order models.Order) 
 
 // GetOrder загружает заказ из БД по order_uid
 func (r *PostgresRepository) GetOrder(ctx context.Context, orderUID string) (models.Order, error) {
+	ctx, span := tracer.Start(ctx, "postgres.GetOrder")
+	defer span.End()
+
+	ctx, cancel := r.withTimeout(ctx)
+	defer cancel()
+
 	var order models.Order
 
 	// 1. Получаем данные из таблицы orders
@@ -187,6 +212,12 @@ func (r *PostgresRepository) GetOrder(ctx context.Context, orderUID string) (mod
 
 // GetAllOrders загружает все заказы из БД (для восстановления кэша при старте)
 func (r *PostgresRepository) GetAllOrders(ctx context.Context) ([]models.Order, error) {
+	ctx, span := tracer.Start(ctx, "postgres.GetAllOrders")
+	defer span.End()
+
+	ctx, cancel := r.withTimeout(ctx)
+	defer cancel()
+
 	// 1. Получаем все order_uid
 	rows, err := r.pool.Query(ctx, "SELECT order_uid FROM orders")
 	if err != nil {

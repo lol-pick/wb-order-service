@@ -2,28 +2,27 @@ package handler
 
 import (
 	"encoding/json"
-	"errors"
 	"log"
 	"net/http"
-	"wb-order-service/internal/cache"
-	"wb-order-service/internal/repository"
 
-	"github.com/go-chi/chi/middleware"
 	"github.com/go-chi/chi/v5"
-	"github.com/jackc/pgx/v5"
+	"github.com/go-chi/chi/v5/middleware"
+	"go.opentelemetry.io/otel"
+
+	"wb-order-service/internal/service"
 )
+
+var tracer = otel.Tracer("handeler")
 
 // Handler - обработчик HTTP-запросов
 type Handler struct {
-	repo  *repository.PostgresRepository
-	cache *cache.OrderCache
+	service service.OrderService
 }
 
 // NewHandler - создает новый обработчки
-func NewHandler(repo *repository.PostgresRepository, cache *cache.OrderCache) *Handler {
+func NewHandler(svc service.OrderService) *Handler {
 	return &Handler{
-		repo:  repo,
-		cache: cache,
+		service: svc,
 	}
 }
 
@@ -32,12 +31,15 @@ func (h *Handler) NewRouter() *chi.Mux {
 	r := chi.NewRouter()
 
 	// Middleware
-	r.Use(middleware.Logger)    // Логирует каждый HTTP запрос
+	r.Use(skipPathLogger("/metrics"))
 	r.Use(middleware.Recoverer) // Ловит паники, не дает серверу упасть
+	r.Use(metricsMiddleware)
 
 	// Маршруты
 	r.Get("/order/{order_uid}", h.GetOrder) // GET /order/uid
-	r.Get("/", h.IndexPage)                 // GET / - главная страница
+	r.Handle("/metrics", PrometheusHandler())
+	r.Get("/health", h.Health)
+	r.Get("/", h.IndexPage) // GET / - главная страница
 
 	// Отдаем статические файлы (HTML, CSS, JS)
 	fileServer := http.FileServer(http.Dir("web"))
@@ -51,42 +53,53 @@ func (h *Handler) NewRouter() *chi.Mux {
 	return r
 }
 
+// skipPathLogger логирует все запросы КРОМЕ указанного пути
+func skipPathLogger(skipPath string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == skipPath {
+				next.ServeHTTP(w, r)
+				return
+			}
+			middleware.Logger(next).ServeHTTP(w, r)
+		})
+	}
+}
+
 // GetOrder - обработчик GET запроса /order/{order_uid}
 func (h *Handler) GetOrder(w http.ResponseWriter, r *http.Request) {
+	// Создаем span для трейсинга
+	ctx, span := tracer.Start(r.Context(), "handler.GetOrder")
+	defer span.End()
+
 	// 1. Извлекаем order_uid из URL
 	orderUID := chi.URLParam(r, "order_uid")
 	if orderUID == "" {
-		http.Error(w, `{"error": "order_uid is required"}`, http.StatusBadRequest)
+		respondError(w, http.StatusBadRequest, "order_uid is required")
 		return
 	}
 
 	// 2. Ищем в кеше
-	order, found := h.cache.Get(orderUID)
-	if found {
-		log.Printf("Cache HIT for order %s\n", orderUID)
-		responJSON(w, http.StatusOK, order)
-		return
-	}
-
-	// 3. Не нашли в кэше - ищем в БД
-	log.Printf("Cache MISS for order %s, querying DB\n", orderUID)
-	order, err := h.repo.GetOrder(r.Context(), orderUID)
+	order, found, err := h.service.GetOrder(ctx, orderUID)
 	if err != nil {
-		// Проверяем: заказ не найден или ошибка в БД
-		if errors.Is(err, pgx.ErrNoRows) {
-			http.Error(w, `{"error": "order not found"}`, http.StatusNotFound)
-			return
-		}
-		log.Printf("Error getting order from DB: %v\n", err)
-		http.Error(w, `{"error": "internal server error"}`, http.StatusInternalServerError)
+		log.Printf("Error getting order: %v\n", err)
+		respondError(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
 
-	// 4. Нашли в БД - кладем в кэш на будущее
-	h.cache.Set(order)
+	if !found {
+		RecordCacheMiss()
+		respondError(w, http.StatusNotFound, "order not found")
+		return
+	}
 
-	// 5. Возвращаем JSON
-	responJSON(w, http.StatusOK, order)
+	// 3. Возвращаем JSON
+	RecordCacheHit()
+	respondJSON(w, http.StatusOK, order)
+}
+
+func (h *Handler) Health(w http.ResponseWriter, r *http.Request) {
+	respondJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
 // IndexPage - отдает главную HTML-страницу
@@ -95,12 +108,15 @@ func (h *Handler) IndexPage(w http.ResponseWriter, r *http.Request) {
 }
 
 // responJSON - вспомогательная функция для отправки JSON-ответов
-func responJSON(w http.ResponseWriter, status int, data any) {
+func respondJSON(w http.ResponseWriter, status int, data any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-
 	err := json.NewEncoder(w).Encode(data)
 	if err != nil {
 		log.Printf("Error encoding JSON response: %v\n", err)
 	}
+}
+
+func respondError(w http.ResponseWriter, status int, message string) {
+	respondJSON(w, status, map[string]string{"error": message})
 }

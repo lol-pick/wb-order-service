@@ -5,82 +5,107 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"time"
+	"strings"
 
 	kafkago "github.com/segmentio/kafka-go"
 
-	"wb-order-service/internal/cache"
+	"wb-order-service/internal/config"
+	"wb-order-service/internal/handler"
 	"wb-order-service/internal/models"
-	"wb-order-service/internal/repository"
+	"wb-order-service/internal/service"
 )
 
 // Consumer - читатель сообщений из Kafka
 type Consumer struct {
-	reader *kafkago.Reader
-	repo   *repository.PostgresRepository
-	cache  *cache.OrderCache
+	reader  *kafkago.Reader
+	service service.OrderService
+	dlq     *DLQWriter
 }
 
 // NewConsumer создает нового Kafka-потребителя
-func NewConsumer(brokers []string, topic string, repo *repository.PostgresRepository, cache *cache.OrderCache) *Consumer {
+func NewConsumer(cfg config.KafkaConfig, svc service.OrderService) *Consumer {
 	reader := kafkago.NewReader(kafkago.ReaderConfig{
-		Brokers:        brokers,
-		Topic:          topic,
-		GroupID:        "order-service",
-		MinBytes:       1,
-		MaxBytes:       10e6,
-		MaxWait:        1 * time.Second,
+		Brokers:        cfg.Brokers,
+		Topic:          cfg.Topic,
+		GroupID:        cfg.GroupID,
+		MinBytes:       cfg.MinBytes,
+		MaxBytes:       cfg.MaxBytes,
+		MaxWait:        cfg.MaxWait,
 		StartOffset:    kafkago.FirstOffset,
 		CommitInterval: 0,
 	})
 
+	dlq := NewDLQWriter(cfg.Brokers, cfg.DLQTopic)
+
 	return &Consumer{
-		reader: reader,
-		repo:   repo,
-		cache:  cache,
+		reader:  reader,
+		service: svc,
+		dlq:     dlq,
 	}
 }
 
 // Run запускает чтение сообщений (блокирующий метод)
 func (c *Consumer) Run(ctx context.Context) {
 	log.Println("Kafka consumer started, waiting for messages...")
-
 	for {
-		//Читаем следующее сообщение из Kafka
-		msg, err := c.reader.FetchMessage(ctx)
-		if err != nil {
-			// Если контекст отмене - выходим (graceful shutdown)
-			if ctx.Err() != nil {
-				log.Println("Kafka consumer stopped")
-				return
-			}
-			log.Printf("Error reading message: %v\n", err)
-			continue
+		// Используем select для проверки ctx.Done()
+		select {
+		case <-ctx.Done():
+			log.Println("Kafka consumer stopped")
+			return
+
+		default:
+			c.safeReadAndProcess(ctx)
 		}
 
-		log.Printf("Received message from Kafka: offset=%d, key=%s\n", msg.Offset, string(msg.Key))
+	}
+}
 
-		// Обрабатываем сообщение
-		err = c.processMessage(ctx, msg)
-		if err != nil {
-			log.Printf("Error processing message: %v\n", err)
-			// НЕ коммитим offset — сообщение будет перечитано
-			continue
+// safeReadAndProcess оборачивает в recover (защита от паник)
+func (c *Consumer) safeReadAndProcess(ctx context.Context) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("PANIC in consumer recovered: %v\n", r)
 		}
+	}()
+	c.readAndProcess(ctx)
+}
 
-		// Подтверждает, что сообщение обработано
-		err = c.reader.CommitMessages(ctx, msg)
-		if err != nil {
-			log.Printf("Error committing message: %v\n", err)
+// readAndProcess читает и обрабатывает одно сообщение
+func (c *Consumer) readAndProcess(ctx context.Context) {
+	msg, err := c.reader.FetchMessage(ctx)
+	if err != nil {
+		if ctx.Err() != nil {
+			return
 		}
+		log.Printf("Error reading message: %v\n", err)
+		return
+	}
+
+	log.Printf("Received message from Kafka: offset = %d, key = %s\n",
+		msg.Offset, string(msg.Key))
+
+	// Обрабатываем сообщение
+	if err = c.processMessage(ctx, msg); err != nil {
+		handler.RecordKafkaMessage("failed")
+		log.Printf("Error processing message: %v\n", err)
+		// Отправляем в DLQ
+		c.dlq.Send(ctx, msg, err.Error())
+		handler.RecordKafkaMessage("dlq")
+	} else {
+		handler.RecordKafkaMessage("processed")
+	}
+
+	// Коммитим в любом случае (успех, ошибка)
+	if err := c.reader.CommitMessages(ctx, msg); err != nil {
+		log.Printf("Error committing message: %v\n", err)
 	}
 }
 
 func (c *Consumer) processMessage(ctx context.Context, msg kafkago.Message) error {
 	// 1. Парсим JSON
 	var order models.Order
-	err := json.Unmarshal(msg.Value, &order)
-	if err != nil {
+	if err := json.Unmarshal(msg.Value, &order); err != nil {
 		return fmt.Errorf("invalid JSON: %w", err)
 	}
 
@@ -90,15 +115,17 @@ func (c *Consumer) processMessage(ctx context.Context, msg kafkago.Message) erro
 	}
 
 	//3. Сохраняем в БД
-	err = c.repo.SaveOrder(ctx, order)
+	err := c.service.SaveOrder(ctx, order)
 	if err != nil {
+		// Если дубликат - просто логируем и пропускаем
+		if strings.Contains(err.Error(), "duplicate") ||
+			strings.Contains(err.Error(), "already exists") {
+			log.Printf("Order %s already exists, skipping\n", order.OrderUID)
+			return nil
+		}
 		return fmt.Errorf("save to DB: %w", err)
 	}
 
-	//4. Добавляем в кэш
-	c.cache.Set(order)
-
-	log.Printf("Order %s processed successfully\n", order.OrderUID)
 	return nil
 }
 
@@ -133,5 +160,8 @@ func validateOrder(order models.Order) error {
 
 // Close закрывает reader
 func (c *Consumer) Close() error {
+	if err := c.dlq.Close(); err != nil {
+		log.Printf("Error closing DLQ writer: %v\n", err)
+	}
 	return c.reader.Close()
 }

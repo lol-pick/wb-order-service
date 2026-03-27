@@ -1,0 +1,14 @@
+linters:
+  enable:
+    - goimports
+    - govet
+    - errcheck
+    - staticcheck
+    - unused
+
+linters-settings:
+  goimports:
+    local-prefixes: wb-order-service
+
+issues:
+  exclude-use-default: false

@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
+	"os"
 	"time"
 
+	"github.com/joho/godotenv"
 	kafkago "github.com/segmentio/kafka-go"
 )
 
@@ -19,30 +21,42 @@ var (
 	products = []string{"Sneakers", "T-Shirt", "Jacket", "Backpack", "Cap"}
 )
 
+func getEnv(key, defaultVal string) string {
+	if val := os.Getenv(key); val != "" {
+		return val
+	}
+	return defaultVal
+}
+
 func main() {
-	// Подключаемся к Kafka
+	_ = godotenv.Load()
+
+	brokerAddr := getEnv("KAFKA_BROKERS", "localhost:9092")
+	topic := getEnv("KAFKA_TOPIC", "orders")
+
 	writer := &kafkago.Writer{
-		Addr:         kafkago.TCP("localhost:9092"),
-		Topic:        "orders",
+		Addr:         kafkago.TCP(brokerAddr),
+		Topic:        topic,
 		Balancer:     &kafkago.LeastBytes{},
 		BatchTimeout: 10 * time.Millisecond,
 	}
-	defer writer.Close()
+	defer func() {
+		if err := writer.Close(); err != nil {
+			log.Printf("Error closing writer: %v\n", err)
+		}
+	}()
 
-	log.Println("Producer started. Sending orders to Kafka...")
+	log.Printf("Producer started. Sending orders to %s topic '%s'...\n", brokerAddr, topic)
 
-	// Отправляем 5 тестовых заказов
-	for i := range 5 {
+	for i := 0; i < 5; i++ {
 		order := generateOrder(i)
 
-		// Превращаем структуру в JSON формат
 		data, err := json.Marshal(order)
 		if err != nil {
 			log.Printf("Error marshaling order: %v\n", err)
 			continue
 		}
 
-		// Отправляем в Kafka
 		err = writer.WriteMessages(context.Background(),
 			kafkago.Message{
 				Key:   []byte(order["order_uid"].(string)),
@@ -55,7 +69,7 @@ func main() {
 		}
 
 		log.Printf("Sent order: %s\n", order["order_uid"])
-		time.Sleep(1 * time.Second) // пауза между отправками
+		time.Sleep(1 * time.Second)
 	}
 
 	log.Println("All orders sent!")
