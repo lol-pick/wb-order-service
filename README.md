@@ -1,6 +1,7 @@
 # WB Order Service
 
-Микросервис для обработки и отображения данных о заказах.
+Микросервис для маркетплейса: получает новые заказы из Kafka, сохраняет их в PostgreSQL одной транзакцией, кэширует в памяти и отдаёт по HTTP API.
+Есть метрики Prometheus, трассировка запросов в Jaeger, модульные и интеграционные тесты.
 
 ## Архитектура
 
@@ -84,7 +85,7 @@ wb-order-service/
 │   └── 001_init.down.sql     # Откат (удаление таблиц)
 ├── web/
 │   └── index.html            # Веб-интерфейс
-├── .env                      # Переменные окружения
+├── .env.example              # Шаблон переменных окружения
 ├── .golangci.yml             # Конфигурация линтера
 ├── prometheus.yml            # Конфигурация Prometheus
 ├── docker-compose.yml        # Docker-инфраструктура
@@ -95,7 +96,7 @@ wb-order-service/
 
 ## Требования
 
-- [Go](https://golang.org/dl/) 1.21+
+- [Go](https://go.dev/dl/) 1.25+
 - [Docker](https://www.docker.com/products/docker-desktop/) и Docker Compose
 - [golangci-lint](https://golangci-lint.run/usage/install/) (для проверки кода)
 
@@ -104,8 +105,9 @@ wb-order-service/
 ### 1. Клонировать репозиторий
 
 ```bash
-git clone <url>
+git clone https://github.com/lol-pick/wb-order-service
 cd wb-order-service
+cp .env.example .env
 ```
 
 ### 2. Поднять инфраструктуру
@@ -211,7 +213,7 @@ Prometheus-метрики в стандартном формате.
 
 ## Конфигурация
 
-Все настройки задаются через переменные окружения (файл `.env`):
+Все настройки задаются через переменные окружения (файл `.env`, шаблон — `.env.example`):
 
 ```env
 # PostgreSQL
@@ -260,9 +262,9 @@ OTEL_SERVICE_NAME=order-service
 - При перезапуске сервиса кэш восстанавливается из БД
 
 ### Надёжность
-- **At Least Once** гарантия: offset коммитится только после обработки
+- Offset в Kafka коммитится вручную, после обработки сообщения
 - Запись в БД выполняется в **транзакции** (все 4 таблицы или ничего)
-- **DLQ** (Dead Letter Queue): невалидные сообщения сохраняются для анализа
+- **DLQ** (Dead Letter Queue): невалидные сообщения и заказы, которые не удалось сохранить, уходят в отдельный топик с причиной ошибки
 - **Таймауты** на все операции с БД
 - **recover** защищает от паник в Kafka consumer
 - **Graceful shutdown** при Ctrl+C
