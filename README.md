@@ -1,5 +1,7 @@
 # WB Order Service
 
+![CI](https://github.com/lol-pick/wb-order-service/actions/workflows/ci.yml/badge.svg)
+
 Микросервис для маркетплейса: получает новые заказы из Kafka, сохраняет их в PostgreSQL одной транзакцией, кэширует в памяти и отдаёт по HTTP API.
 Есть метрики Prometheus, трассировка запросов в Jaeger, модульные и интеграционные тесты.
 
