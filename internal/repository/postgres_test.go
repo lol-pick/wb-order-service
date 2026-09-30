@@ -2,6 +2,7 @@ package repository
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"testing"
@@ -196,8 +197,8 @@ func TestPostgres_DuplicateOrder(t *testing.T) {
 
 	// Второе сохрание - должно быть ошибка дубликата
 	err = repo.SaveOrder(ctx, order)
-	if err == nil {
-		t.Fatalf("Expected duplicate error, got nil")
+	if !errors.Is(err, models.ErrOrderExists) {
+		t.Fatalf("Expected ErrOrderExists, got %v", err)
 	}
 }
 

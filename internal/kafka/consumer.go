@@ -3,9 +3,10 @@ package kafka
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
-	"strings"
+	"time"
 
 	kafkago "github.com/segmentio/kafka-go"
 
@@ -13,6 +14,14 @@ import (
 	"wb-order-service/internal/handler"
 	"wb-order-service/internal/models"
 	"wb-order-service/internal/service"
+)
+
+const (
+	// Сколько раз пробуем сохранить заказ в БД, прежде чем отправить его в DLQ
+	maxSaveAttempts = 5
+	// Начальная и максимальная пауза между повторами
+	retryBaseDelay = 200 * time.Millisecond
+	retryMaxDelay  = 5 * time.Second
 )
 
 // Consumer - читатель сообщений из Kafka
@@ -48,16 +57,13 @@ func NewConsumer(cfg config.KafkaConfig, svc service.OrderService) *Consumer {
 func (c *Consumer) Run(ctx context.Context) {
 	log.Println("Kafka consumer started, waiting for messages...")
 	for {
-		// Используем select для проверки ctx.Done()
 		select {
 		case <-ctx.Done():
 			log.Println("Kafka consumer stopped")
 			return
-
 		default:
 			c.safeReadAndProcess(ctx)
 		}
-
 	}
 }
 
@@ -71,7 +77,8 @@ func (c *Consumer) safeReadAndProcess(ctx context.Context) {
 	c.readAndProcess(ctx)
 }
 
-// readAndProcess читает и обрабатывает одно сообщение
+// readAndProcess читает одно сообщение и коммитит offset,
+// только если сообщение обработано до конца.
 func (c *Consumer) readAndProcess(ctx context.Context) {
 	msg, err := c.reader.FetchMessage(ctx)
 	if err != nil {
@@ -85,48 +92,104 @@ func (c *Consumer) readAndProcess(ctx context.Context) {
 	log.Printf("Received message from Kafka: offset = %d, key = %s\n",
 		msg.Offset, string(msg.Key))
 
-	// Обрабатываем сообщение
-	if err = c.processMessage(ctx, msg); err != nil {
-		handler.RecordKafkaMessage("failed")
-		log.Printf("Error processing message: %v\n", err)
-		// Отправляем в DLQ
-		c.dlq.Send(ctx, msg, err.Error())
-		handler.RecordKafkaMessage("dlq")
-	} else {
-		handler.RecordKafkaMessage("processed")
+	if err := c.handle(ctx, msg); err != nil {
+		// Сюда попадаем только при остановке сервиса.
+		// Offset не коммитим: после перезапуска Kafka отдаст сообщение снова.
+		log.Printf("Message offset=%d not committed: %v\n", msg.Offset, err)
+		return
 	}
 
-	// Коммитим в любом случае (успех, ошибка)
 	if err := c.reader.CommitMessages(ctx, msg); err != nil {
 		log.Printf("Error committing message: %v\n", err)
 	}
 }
 
-func (c *Consumer) processMessage(ctx context.Context, msg kafkago.Message) error {
-	// 1. Парсим JSON
-	var order models.Order
-	if err := json.Unmarshal(msg.Value, &order); err != nil {
-		return fmt.Errorf("invalid JSON: %w", err)
-	}
-
-	//2. Валидация - проверяем обязательные поля
-	if err := validateOrder(order); err != nil {
-		return fmt.Errorf("validation failed: %w", err)
-	}
-
-	//3. Сохраняем в БД
-	err := c.service.SaveOrder(ctx, order)
+// handle возвращает nil, только когда offset можно коммитить:
+// заказ сохранён, это дубль или сообщение надёжно записано в DLQ.
+func (c *Consumer) handle(ctx context.Context, msg kafkago.Message) error {
+	order, err := decodeOrder(msg.Value)
 	if err != nil {
-		// Если дубликат - просто логируем и пропускаем
-		if strings.Contains(err.Error(), "duplicate") ||
-			strings.Contains(err.Error(), "already exists") {
+		// Битое сообщение: повторять бессмысленно, сразу в DLQ
+		handler.RecordKafkaMessage("failed")
+		log.Printf("Invalid message: %v\n", err)
+		return c.sendToDLQ(ctx, msg, err)
+	}
+
+	err = retry(ctx, maxSaveAttempts, func() error {
+		err := c.service.SaveOrder(ctx, order)
+		if errors.Is(err, models.ErrOrderExists) {
 			log.Printf("Order %s already exists, skipping\n", order.OrderUID)
 			return nil
 		}
-		return fmt.Errorf("save to DB: %w", err)
+		return err
+	})
+	if err == nil {
+		handler.RecordKafkaMessage("processed")
+		return nil
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
 	}
 
+	// БД недоступна дольше, чем длятся все повторы: откладываем сообщение в DLQ
+	handler.RecordKafkaMessage("failed")
+	log.Printf("Save failed after %d attempts: %v\n", maxSaveAttempts, err)
+	return c.sendToDLQ(ctx, msg, err)
+}
+
+// sendToDLQ повторяет отправку в DLQ, пока она не пройдёт или сервис не остановят.
+// Пока DLQ недоступна, консьюмер ждёт: лучше остановиться, чем потерять сообщение.
+func (c *Consumer) sendToDLQ(ctx context.Context, msg kafkago.Message, reason error) error {
+	err := retry(ctx, 0, func() error {
+		return c.dlq.Send(ctx, msg, reason.Error())
+	})
+	if err != nil {
+		return err
+	}
+	handler.RecordKafkaMessage("dlq")
 	return nil
+}
+
+// retry вызывает fn, пока она не вернёт nil, пока не кончатся попытки
+// или пока не отменят ctx. attempts == 0 означает «повторять без ограничения».
+// Пауза между попытками растёт вдвое, но не больше retryMaxDelay.
+func retry(ctx context.Context, attempts int, fn func() error) error {
+	delay := retryBaseDelay
+	for i := 1; ; i++ {
+		err := fn()
+		if err == nil {
+			return nil
+		}
+		if attempts > 0 && i >= attempts {
+			return err
+		}
+		log.Printf("Attempt %d failed: %v; retry in %s\n", i, err, delay)
+
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+
+		delay *= 2
+		if delay > retryMaxDelay {
+			delay = retryMaxDelay
+		}
+	}
+}
+
+// decodeOrder разбирает JSON и проверяет обязательные поля
+func decodeOrder(data []byte) (models.Order, error) {
+	var order models.Order
+	if err := json.Unmarshal(data, &order); err != nil {
+		return models.Order{}, fmt.Errorf("invalid JSON: %w", err)
+	}
+	if err := validateOrder(order); err != nil {
+		return models.Order{}, fmt.Errorf("validation failed: %w", err)
+	}
+	return order, nil
 }
 
 // validateOrder проверяет обязательные поля заказа
