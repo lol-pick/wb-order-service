@@ -2,11 +2,13 @@ package repository
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
 	"wb-order-service/internal/models"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.opentelemetry.io/otel"
 )
@@ -74,6 +76,11 @@ func (r *PostgresRepository) SaveOrder(ctx context.Context, order models.Order) 
 		order.ShardKey, order.SmID, order.DateCreated, order.OofShard,
 	)
 	if err != nil {
+		// 23505 — код PostgreSQL unique_violation: заказ с таким order_uid уже есть
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			return models.ErrOrderExists
+		}
 		return fmt.Errorf("insert order: %w", err)
 	}
 

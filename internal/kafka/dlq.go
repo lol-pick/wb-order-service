@@ -2,6 +2,7 @@ package kafka
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"time"
 
@@ -26,9 +27,9 @@ func NewDLQWriter(brokers []string, topic string) *DLQWriter {
 	}
 }
 
-// Send отправляет сообщение в DLQ с таймаутом
-func (d *DLQWriter) Send(ctx context.Context, msg kafkago.Message, reason string) {
-	// Таймаут 5 секунд на отправку
+// Send отправляет сообщение в DLQ с таймаутом.
+// Возвращает ошибку, чтобы вызывающий код не коммитил offset, пока запись не прошла.
+func (d *DLQWriter) Send(ctx context.Context, msg kafkago.Message, reason string) error {
 	sendCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
@@ -41,13 +42,11 @@ func (d *DLQWriter) Send(ctx context.Context, msg kafkago.Message, reason string
 		},
 	}
 
-	err := d.writer.WriteMessages(sendCtx, dlqMsg)
-	if err != nil {
-		// Если не удалось отправить в DLQ — просто логируем
-		log.Printf("Failed to send message to DLQ (non-critical): %v\n", err)
-	} else {
-		log.Printf("Message sent to DLQ: key=%s, reason=%s\n", string(msg.Key), reason)
+	if err := d.writer.WriteMessages(sendCtx, dlqMsg); err != nil {
+		return fmt.Errorf("write to DLQ: %w", err)
 	}
+	log.Printf("Message sent to DLQ: key=%s, reason=%s\n", string(msg.Key), reason)
+	return nil
 }
 
 // Close закрывает writer
