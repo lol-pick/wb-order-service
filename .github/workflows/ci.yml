@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: wb_user
+          POSTGRES_PASSWORD: wb_password
+          POSTGRES_DB: wb_orders
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U wb_user"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      TEST_POSTGRES_CONN: postgres://wb_user:wb_password@localhost:5432/wb_orders?sslmode=disable
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Apply migrations
+        run: psql "$TEST_POSTGRES_CONN" -f migrations/001_init.up.sql
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test (with race detector)
+        # -p 1: пакеты с интеграционными тестами используют одну БД, запускаем их по очереди
+        run: go test -race -count=1 -p 1 ./...
