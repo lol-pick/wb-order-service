@@ -29,7 +29,7 @@ var (
 			Name: "kafka_messages_total",
 			Help: "Total number of Kafka messages",
 		},
-		[]string{"status"}, // "processed", "failed", "dlq"
+		[]string{"status"}, // "processed", "failed", "dlq", "retry"
 	)
 )
 

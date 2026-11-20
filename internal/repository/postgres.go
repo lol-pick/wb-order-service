@@ -43,6 +43,24 @@ func (r *PostgresRepository) Close() {
 	r.pool.Close()
 }
 
+// writeErr оборачивает ошибку записи и помечает «плохие данные» sentinel-ошибкой ErrInvalidOrder.
+// Коды PostgreSQL (SQLSTATE) группируются по первым двум символам — классу:
+//   - 22 (data exception) — значение не подходит под тип: строка длиннее varchar(N), переполнение числа;
+//   - 23 (integrity constraint violation) — нарушено ограничение: NOT NULL, CHECK, внешний ключ.
+//
+// Такие ошибки повторять бессмысленно. Всё остальное (нет соединения, таймаут, БД перезапускается)
+// считается временным, и консьюмер будет повторять, пока БД не вернётся.
+func writeErr(op string, err error) error {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && len(pgErr.Code) == 5 {
+		if class := pgErr.Code[:2]; class == "22" || class == "23" {
+			// Два %w (Go 1.20+): errors.Is найдёт и ErrInvalidOrder, и исходную ошибку pgx
+			return fmt.Errorf("%s: %w: %w", op, models.ErrInvalidOrder, err)
+		}
+	}
+	return fmt.Errorf("%s: %w", op, err)
+}
+
 // withTimeout оборачивает контекст таймаутом
 func (r *PostgresRepository) withTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(ctx, r.timeout)
@@ -82,7 +100,7 @@ func (r *PostgresRepository) SaveOrder(ctx context.Context, order models.Order) 
 		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
 			return models.ErrOrderExists
 		}
-		return fmt.Errorf("insert order: %w", err)
+		return writeErr("insert order", err)
 	}
 
 	// 2. Вставляем в таблицу deliveries
@@ -96,7 +114,7 @@ func (r *PostgresRepository) SaveOrder(ctx context.Context, order models.Order) 
 		order.Delivery.Email,
 	)
 	if err != nil {
-		return fmt.Errorf("insert delivery: %w", err)
+		return writeErr("insert delivery", err)
 	}
 
 	// 3. Вставляем в таблицу payments
@@ -113,7 +131,7 @@ func (r *PostgresRepository) SaveOrder(ctx context.Context, order models.Order) 
 		order.Payment.GoodsTotal, order.Payment.CustomFee,
 	)
 	if err != nil {
-		return fmt.Errorf("insert payment: %w", err)
+		return writeErr("insert payment", err)
 	}
 
 	// 4. Вставляем каждый товар в таблицу items
@@ -129,12 +147,15 @@ func (r *PostgresRepository) SaveOrder(ctx context.Context, order models.Order) 
 			item.NmID, item.Brand, item.Status,
 		)
 		if err != nil {
-			return fmt.Errorf("insert item %d: %w", i, err)
+			return writeErr(fmt.Sprintf("insert item %d", i), err)
 		}
 	}
 
 	// 5. Фиксируем транзакцию — все 4 вставки применяются РАЗОМ
-	return tx.Commit(ctx)
+	if err := tx.Commit(ctx); err != nil {
+		return writeErr("commit transaction", err)
+	}
+	return nil
 }
 
 // GetOrder загружает заказ из БД по order_uid

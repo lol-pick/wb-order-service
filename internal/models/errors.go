@@ -12,3 +12,8 @@ var ErrOrderExists = errors.New("order already exists")
 
 // ErrOrderNotFound — заказа с таким order_uid нет в БД.
 var ErrOrderNotFound = errors.New("order not found")
+
+// ErrInvalidOrder — БД отвергла сами данные заказа (слишком длинная строка,
+// нарушение ограничения и т.п.). Повтор ничего не изменит — такое сообщение уходит в DLQ.
+// Отличается от временных ошибок (БД недоступна, таймаут), которые нужно повторять.
+var ErrInvalidOrder = errors.New("order rejected by database")

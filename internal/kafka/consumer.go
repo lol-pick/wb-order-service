@@ -17,8 +17,6 @@ import (
 )
 
 const (
-	// Сколько раз пробуем сохранить заказ в БД, прежде чем отправить его в DLQ
-	maxSaveAttempts = 5
 	// Начальная и максимальная пауза между повторами
 	retryBaseDelay = 200 * time.Millisecond
 	retryMaxDelay  = 5 * time.Second
@@ -126,26 +124,43 @@ func (c *Consumer) handle(ctx context.Context, msg kafkago.Message) error {
 	// SaveOrder получает ctx без отмены (таймаут на запросы ставит репозиторий).
 	// А ожидание между повторами прерывается по ctx — новых попыток после сигнала не будет.
 	saveCtx := context.WithoutCancel(ctx)
-	err = retry(ctx, maxSaveAttempts, func() error {
+
+	// Ошибки делятся на два вида:
+	//   - временные (БД недоступна, таймаут) — повторяем БЕЗ ограничения, пока БД не вернётся.
+	//     DLQ для них не подходит: при упавшей БД падали бы все сообщения подряд,
+	//     и рабочие заказы оседали бы в DLQ, где их никто не переобработает;
+	//   - постоянные (ErrInvalidOrder: БД отвергла сами данные) — повтор не поможет, сразу в DLQ.
+	// Пока идут повторы, оффсет не коммитится: после перезапуска сервис продолжит с этого же сообщения.
+	var invalidErr error
+	err = retry(ctx, 0, func() error {
 		err := c.service.SaveOrder(saveCtx, order)
-		if errors.Is(err, models.ErrOrderExists) {
+		switch {
+		case err == nil:
+			return nil
+		case errors.Is(err, models.ErrOrderExists):
 			log.Printf("Order %s already exists, skipping\n", order.OrderUID)
 			return nil
+		case errors.Is(err, models.ErrInvalidOrder):
+			invalidErr = err
+			return nil // выходим из повторов, решение о DLQ — ниже
+		default:
+			metrics.RecordKafkaMessage("retry") // рост этой метрики = БД недоступна, повод для алерта
+			return err
 		}
-		return err
 	})
-	if err == nil {
+	if err != nil {
+		// retry без ограничения попыток возвращает ошибку только при отмене ctx (остановка сервиса)
+		return err
+	}
+	if invalidErr == nil {
 		metrics.RecordKafkaMessage("processed")
 		return nil
 	}
-	if ctx.Err() != nil {
-		return ctx.Err()
-	}
 
-	// БД недоступна дольше, чем длятся все повторы: откладываем сообщение в DLQ
+	// БД отвергла данные заказа: откладываем сообщение в DLQ
 	metrics.RecordKafkaMessage("failed")
-	log.Printf("Save failed after %d attempts: %v\n", maxSaveAttempts, err)
-	return c.sendToDLQ(ctx, msg, err)
+	log.Printf("Order %s rejected by DB: %v\n", order.OrderUID, invalidErr)
+	return c.sendToDLQ(ctx, msg, invalidErr)
 }
 
 // sendToDLQ повторяет отправку в DLQ, пока она не пройдёт или сервис не остановят.
