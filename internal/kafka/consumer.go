@@ -22,6 +22,8 @@ const (
 	// Начальная и максимальная пауза между повторами
 	retryBaseDelay = 200 * time.Millisecond
 	retryMaxDelay  = 5 * time.Second
+	// Сколько ждём подтверждения оффсета, если сервис уже останавливается
+	commitTimeout = 5 * time.Second
 )
 
 // Consumer - читатель сообщений из Kafka
@@ -99,7 +101,12 @@ func (c *Consumer) readAndProcess(ctx context.Context) {
 		return
 	}
 
-	if err := c.reader.CommitMessages(ctx, msg); err != nil {
+	// Заказ уже сохранён — оффсет нужно подтвердить, даже если пришёл сигнал остановки.
+	// С отменённым ctx коммит сразу упал бы, и после перезапуска сообщение пришло бы повторно.
+	// context.WithoutCancel (Go 1.21+) — копия ctx без отмены; свой таймаут, чтобы не зависнуть.
+	commitCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), commitTimeout)
+	defer cancel()
+	if err := c.reader.CommitMessages(commitCtx, msg); err != nil {
 		log.Printf("Error committing message: %v\n", err)
 	}
 }
@@ -115,8 +122,12 @@ func (c *Consumer) handle(ctx context.Context, msg kafkago.Message) error {
 		return c.sendToDLQ(ctx, msg, err)
 	}
 
+	// Начатую попытку сохранения доводим до конца даже при остановке сервиса:
+	// SaveOrder получает ctx без отмены (таймаут на запросы ставит репозиторий).
+	// А ожидание между повторами прерывается по ctx — новых попыток после сигнала не будет.
+	saveCtx := context.WithoutCancel(ctx)
 	err = retry(ctx, maxSaveAttempts, func() error {
-		err := c.service.SaveOrder(ctx, order)
+		err := c.service.SaveOrder(saveCtx, order)
 		if errors.Is(err, models.ErrOrderExists) {
 			log.Printf("Order %s already exists, skipping\n", order.OrderUID)
 			return nil

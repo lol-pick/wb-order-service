@@ -77,7 +77,13 @@ func main() {
 		}
 	}()
 
-	go consumer.Run(kafkaCtx)
+	// consumerDone закроется, когда Run вернётся, — так main узнает,
+	// что консьюмер доделал текущее сообщение и больше не трогает БД.
+	consumerDone := make(chan struct{})
+	go func() {
+		defer close(consumerDone)
+		consumer.Run(kafkaCtx)
+	}()
 	log.Println("Kafka consumer started")
 
 	//7. Настраиваем HTTP-сервер
@@ -105,14 +111,25 @@ func main() {
 	sig := <-quit
 	log.Printf("Recived signal: %v. Shutting down...\n", sig)
 
-	// 8. Останавливаем все
+	// 10. Останавливаем всё. Порядок важен:
+	// сначала перестаём принимать работу (HTTP и Kafka), ждём, пока текущая доделается,
+	// и только потом закрываем консьюмер и пул БД (это делают defer'ы выше, в обратном порядке).
 	kafkaCancel()
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(ctx, cfg.HTTP.WriteTimeout)
 	defer shutdownCancel()
 
+	// Shutdown перестаёт принимать новые соединения и ждёт завершения текущих запросов
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		log.Printf("HTTP server shutdown error: %v\n", err)
+	}
+
+	// Ждём консьюмер, но не бесконечно: общий лимит на остановку — shutdownCtx
+	select {
+	case <-consumerDone:
+		log.Println("Kafka consumer finished")
+	case <-shutdownCtx.Done():
+		log.Println("Timeout waiting for Kafka consumer")
 	}
 
 	log.Println("Service stopped graceffuly!")
