@@ -8,6 +8,7 @@ import (
 
 	"wb-order-service/internal/models"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.opentelemetry.io/otel"
@@ -158,6 +159,11 @@ func (r *PostgresRepository) GetOrder(ctx context.Context, orderUID string) (mod
 		&order.ShardKey, &order.SmID, &order.DateCreated, &order.OofShard,
 	)
 	if err != nil {
+		// pgx.ErrNoRows — sentinel драйвера: запрос не вернул ни одной строки.
+		// Переводим в доменную ошибку, чтобы слой выше не зависел от pgx.
+		if errors.Is(err, pgx.ErrNoRows) {
+			return models.Order{}, models.ErrOrderNotFound
+		}
 		return models.Order{}, fmt.Errorf("select order: %w", err)
 	}
 
@@ -212,6 +218,9 @@ func (r *PostgresRepository) GetOrder(ctx context.Context, orderUID string) (mod
 			return models.Order{}, fmt.Errorf("scan item: %w", err)
 		}
 		order.Items = append(order.Items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return models.Order{}, fmt.Errorf("iterate items: %w", err)
 	}
 
 	return order, nil

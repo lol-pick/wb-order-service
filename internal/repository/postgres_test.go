@@ -212,8 +212,8 @@ func TestPostgres_GetOrder_NotFound(t *testing.T) {
 	defer repo.Close()
 
 	_, err = repo.GetOrder(ctx, "nonexistent-order-id")
-	if err == nil {
-		t.Fatalf("Expected error for nonexistent order")
+	if !errors.Is(err, models.ErrOrderNotFound) {
+		t.Fatalf("Expected ErrOrderNotFound, got %v", err)
 	}
 }
 

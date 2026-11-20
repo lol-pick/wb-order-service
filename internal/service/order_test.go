@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -47,7 +48,8 @@ func (m *mockRepo) GetOrder(_ context.Context, uid string) (models.Order, error)
 	}
 	order, ok := m.orders[uid]
 	if !ok {
-		return models.Order{}, fmt.Errorf("order not found: %s", uid)
+		// Как настоящий репозиторий: обёрнутый sentinel
+		return models.Order{}, fmt.Errorf("get %s: %w", uid, models.ErrOrderNotFound)
 	}
 	return order, nil
 }
@@ -295,11 +297,31 @@ func TestGetOrder_NotFound(t *testing.T) {
 	svc := NewOrderService(repo, cache)
 
 	// Выполнение - ищем несущствующий заказ
-	_, _, err := svc.GetOrder(context.Background(), "nonexistent")
+	_, found, err := svc.GetOrder(context.Background(), "nonexistent")
 
-	// Проверка - должна быть ошибка
+	// Проверка - «не найден» это не ошибка: found=false, err=nil (хендлер ответит 404, а не 500)
+	if err != nil {
+		t.Fatalf("expected nil error for nonexistent order, got %v", err)
+	}
+	if found {
+		t.Fatalf("expected found=false for nonexistent order")
+	}
+}
+
+// Тест - настоящая ошибка БД не маскируется под «не найден»
+func TestGetOrder_RepoError(t *testing.T) {
+	repo := newMockRepo()
+	repo.getError = errors.New("connection refused")
+	cache := newMockCache()
+	svc := NewOrderService(repo, cache)
+
+	_, found, err := svc.GetOrder(context.Background(), "order-1")
+
 	if err == nil {
-		t.Fatalf("expected error for nonexistent order")
+		t.Fatalf("expected repository error, got nil")
+	}
+	if found {
+		t.Fatalf("expected found=false on repository error")
 	}
 }
 

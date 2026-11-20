@@ -2,9 +2,9 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
-	"strings"
 
 	"wb-order-service/internal/models"
 
@@ -61,8 +61,9 @@ func (s *orderService) GetOrder(ctx context.Context, orderUID string) (models.Or
 	log.Printf("Cache MISS for order %s, querying DB\n", orderUID)
 	order, err := s.repo.GetOrder(ctx, orderUID)
 	if err != nil {
-		// Если ошибка - "no rows" - заказ не найден
-		if strings.Contains(err.Error(), "no rows") {
+		// Заказа нет — это не ошибка сервиса, а обычный ответ «не найден» (404).
+		// errors.Is сравнивает с sentinel по всей цепочке обёрток (%w), а не по тексту.
+		if errors.Is(err, models.ErrOrderNotFound) {
 			return models.Order{}, false, nil
 		}
 		// Иначе - реальная ошибка БД
