@@ -71,7 +71,6 @@ func (r *PostgresRepository) SaveOrder(ctx context.Context, order models.Order) 
 	ctx, span := tracer.Start(ctx, "postgres.SaveOrder")
 	defer span.End()
 
-	//Начинаем транзакцию
 	ctx, cancel := r.withTimeout(ctx)
 	defer cancel()
 
@@ -79,12 +78,19 @@ func (r *PostgresRepository) SaveOrder(ctx context.Context, order models.Order) 
 	if err != nil {
 		return fmt.Errorf("begin transaction: %w", err)
 	}
-	// Если произойдет ошибка - откатим все изменения
+	// Если произойдет ошибка - откатим все изменения (после Commit это no-op)
 	defer func() {
 		_ = tx.Rollback(context.Background())
 	}()
-	// 1. Вставляем таблицу orders
-	_, err = tx.Exec(ctx, `
+
+	// Все вставки отправляем ОДНИМ пакетом (pgx.Batch): pgx пишет запросы в соединение подряд,
+	// не дожидаясь ответа на каждый (pipelining), и читает ответы потом.
+	// Раньше было 3 + len(items) отдельных запросов — каждый ждал ответа БД (round trip).
+	// Теперь на заказ 3 обмена с БД при любом числе товаров: BEGIN, пакет, COMMIT.
+	batch := &pgx.Batch{}
+
+	// 1. orders
+	batch.Queue(`
 		INSERT INTO orders (
 			order_uid, track_number, entry, locale,
 			internal_signature, customer_id, delivery_service,
@@ -94,17 +100,9 @@ func (r *PostgresRepository) SaveOrder(ctx context.Context, order models.Order) 
 		order.InternalSignature, order.CustomerID, order.DeliveryService,
 		order.ShardKey, order.SmID, order.DateCreated, order.OofShard,
 	)
-	if err != nil {
-		// 23505 — код PostgreSQL unique_violation: заказ с таким order_uid уже есть
-		var pgErr *pgconn.PgError
-		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
-			return models.ErrOrderExists
-		}
-		return writeErr("insert order", err)
-	}
 
-	// 2. Вставляем в таблицу deliveries
-	_, err = tx.Exec(ctx, `
+	// 2. deliveries
+	batch.Queue(`
 		INSERT INTO deliveries (
 			order_uid, name, phone, zip, city, address, region, email
 		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
@@ -113,12 +111,9 @@ func (r *PostgresRepository) SaveOrder(ctx context.Context, order models.Order) 
 		order.Delivery.City, order.Delivery.Address, order.Delivery.Region,
 		order.Delivery.Email,
 	)
-	if err != nil {
-		return writeErr("insert delivery", err)
-	}
 
-	// 3. Вставляем в таблицу payments
-	_, err = tx.Exec(ctx, `
+	// 3. payments
+	batch.Queue(`
 		INSERT INTO payments (
 			order_uid, transaction, request_id, currency, provider,
 			amount, payment_dt, bank, delivery_cost, goods_total, custom_fee
@@ -130,13 +125,10 @@ func (r *PostgresRepository) SaveOrder(ctx context.Context, order models.Order) 
 		order.Payment.Bank, order.Payment.DeliveryCost,
 		order.Payment.GoodsTotal, order.Payment.CustomFee,
 	)
-	if err != nil {
-		return writeErr("insert payment", err)
-	}
 
-	// 4. Вставляем каждый товар в таблицу items
-	for i, item := range order.Items {
-		_, err = tx.Exec(ctx, `
+	// 4. items — по запросу на товар, но все в том же пакете
+	for _, item := range order.Items {
+		batch.Queue(`
 			INSERT INTO items (
 				order_uid, chrt_id, track_number, price, rid, name,
 				sale, size, total_price, nm_id, brand, status
@@ -146,16 +138,52 @@ func (r *PostgresRepository) SaveOrder(ctx context.Context, order models.Order) 
 			item.Name, item.Sale, item.Size, item.TotalPrice,
 			item.NmID, item.Brand, item.Status,
 		)
-		if err != nil {
-			return writeErr(fmt.Sprintf("insert item %d", i), err)
-		}
 	}
 
-	// 5. Фиксируем транзакцию — все 4 вставки применяются РАЗОМ
+	if err := execBatch(ctx, tx, batch); err != nil {
+		return err
+	}
+
+	// 5. Фиксируем транзакцию — все вставки применяются РАЗОМ
 	if err := tx.Commit(ctx); err != nil {
 		return writeErr("commit transaction", err)
 	}
 	return nil
+}
+
+// execBatch отправляет пакет и читает результаты строго по порядку постановки в очередь.
+// Первый запрос — вставка в orders: её unique_violation означает дубль заказа.
+func execBatch(ctx context.Context, tx pgx.Tx, batch *pgx.Batch) error {
+	br := tx.SendBatch(ctx, batch)
+	// Close обязателен до следующего запроса в этой транзакции (иначе «conn busy»).
+	// Ошибку Close игнорируем: первую ошибку пакета мы уже вернём из цикла ниже.
+	defer func() { _ = br.Close() }()
+
+	for i := 0; i < batch.Len(); i++ {
+		if _, err := br.Exec(); err != nil {
+			// 23505 — unique_violation: заказ с таким order_uid уже есть
+			var pgErr *pgconn.PgError
+			if i == 0 && errors.As(err, &pgErr) && pgErr.Code == "23505" {
+				return models.ErrOrderExists
+			}
+			return writeErr(batchStepName(i), err)
+		}
+	}
+	return nil
+}
+
+// batchStepName — название шага пакета для текста ошибки
+func batchStepName(i int) string {
+	switch i {
+	case 0:
+		return "insert order"
+	case 1:
+		return "insert delivery"
+	case 2:
+		return "insert payment"
+	default:
+		return fmt.Sprintf("insert item %d", i-3)
+	}
 }
 
 // GetOrder загружает заказ из БД по order_uid
