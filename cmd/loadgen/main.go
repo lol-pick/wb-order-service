@@ -134,19 +134,27 @@ func runProduce(cfg *config.Config, args []string) error {
 	}
 	log.Printf("sent in %v, waiting for the consumer...", time.Since(start).Round(time.Millisecond))
 
-	// Опрашиваем БД, пока не появятся все N заказов
+	// Опрашиваем БД, пока не появятся все N заказов.
+	// Ошибку запроса не считаем фатальной: в тесте надёжности БД специально останавливают,
+	// и loadgen должен дождаться её возвращения, а не упасть. pgxpool сам переподключится.
 	deadline := time.Now().Add(*timeout)
 	var stored int
 	for {
+		var cnt int
 		err := pool.QueryRow(ctx,
-			`SELECT count(*) FROM orders WHERE order_uid LIKE $1`, prefix+"%").Scan(&stored)
+			`SELECT count(*) FROM orders WHERE order_uid LIKE $1`, prefix+"%").Scan(&cnt)
 		if err != nil {
-			return fmt.Errorf("count orders: %w", err)
+			log.Printf("  count failed (DB unavailable?): %v", err)
+		} else {
+			stored = cnt
+			if stored >= *n {
+				break
+			}
+			log.Printf("  stored %d / %d", stored, *n)
 		}
-		if stored >= *n || time.Now().After(deadline) {
+		if time.Now().After(deadline) {
 			break
 		}
-		log.Printf("  stored %d / %d", stored, *n)
 		time.Sleep(500 * time.Millisecond)
 	}
 	elapsed := time.Since(start)
