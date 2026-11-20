@@ -52,10 +52,13 @@ func (m *mockRepo) GetOrder(_ context.Context, uid string) (models.Order, error)
 	return order, nil
 }
 
-// GetAllOrders - имитирует поиск в бд
-func (m *mockRepo) GetAllOrders(_ context.Context) ([]models.Order, error) {
+// GetRecentOrders - имитирует выборку последних заказов (порядок в моке не важен)
+func (m *mockRepo) GetRecentOrders(_ context.Context, limit int) ([]models.Order, error) {
 	var orders []models.Order
 	for _, o := range m.orders {
+		if len(orders) == limit {
+			break
+		}
 		orders = append(orders, o)
 	}
 	return orders, nil
@@ -313,7 +316,7 @@ func TestRestoreCache(t *testing.T) {
 	repo.orders["order-3"] = createTestOrder("order-3")
 
 	// Выполенние
-	err := svc.RestoreCache(context.Background())
+	err := svc.RestoreCache(context.Background(), 1000)
 
 	// Проверка
 	if err != nil {
@@ -338,7 +341,7 @@ func TestRestoreCache_Empty(t *testing.T) {
 	svc := NewOrderService(repo, cache)
 
 	// Выполение - repo пустой
-	err := svc.RestoreCache(context.Background())
+	err := svc.RestoreCache(context.Background(), 1000)
 
 	// Проверка
 	if err != nil {
@@ -346,5 +349,39 @@ func TestRestoreCache_Empty(t *testing.T) {
 	}
 	if cache.Size() != 0 {
 		t.Errorf("Expected 0 orders in cache, got %d", cache.Size())
+	}
+}
+
+// Тест: прогрев не берёт больше limit заказов
+func TestRestoreCache_RespectsLimit(t *testing.T) {
+	repo := newMockRepo()
+	cache := newMockCache()
+	svc := NewOrderService(repo, cache)
+
+	for i := 0; i < 5; i++ {
+		uid := fmt.Sprintf("order-%d", i)
+		repo.orders[uid] = createTestOrder(uid)
+	}
+
+	if err := svc.RestoreCache(context.Background(), 2); err != nil {
+		t.Fatalf("RestoreCache failed: %v", err)
+	}
+	if cache.Size() != 2 {
+		t.Errorf("Expected 2 orders in cache, got %d", cache.Size())
+	}
+}
+
+// Тест: limit = 0 выключает прогрев
+func TestRestoreCache_Disabled(t *testing.T) {
+	repo := newMockRepo()
+	cache := newMockCache()
+	svc := NewOrderService(repo, cache)
+	repo.orders["order-1"] = createTestOrder("order-1")
+
+	if err := svc.RestoreCache(context.Background(), 0); err != nil {
+		t.Fatalf("RestoreCache failed: %v", err)
+	}
+	if cache.Size() != 0 {
+		t.Errorf("Expected empty cache, got %d", cache.Size())
 	}
 }

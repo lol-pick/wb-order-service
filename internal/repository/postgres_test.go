@@ -217,8 +217,8 @@ func TestPostgres_GetOrder_NotFound(t *testing.T) {
 	}
 }
 
-// Тест GetAllOrders содержит наш заказ
-func TestPostgres_GetAllOrders(t *testing.T) {
+// Тест GetRecentOrders: возвращает самые свежие заказы, не больше limit, вместе с товарами
+func TestPostgres_GetRecentOrders(t *testing.T) {
 	ctx := context.Background()
 	repo, err := NewPostgresRepository(ctx, getTestConnString(), 5*time.Second)
 	if err != nil {
@@ -226,26 +226,34 @@ func TestPostgres_GetAllOrders(t *testing.T) {
 	}
 	defer repo.Close()
 
-	order := createIntegrationTestOrder()
-
-	err = repo.SaveOrder(ctx, order)
-	if err != nil {
-		t.Fatalf("SaveOrder failed: %v", err)
-	}
-
-	orders, err := repo.GetAllOrders(ctx)
-	if err != nil {
-		t.Fatalf("GetAllOrders failed: %v", err)
-	}
-
-	found := false
-	for _, o := range orders {
-		if o.OrderUID == order.OrderUID {
-			found = true
+	// Три заказа «из будущего» — гарантированно новее всех остальных в тестовой БД
+	var saved []models.Order
+	for i := 1; i <= 3; i++ {
+		order := createIntegrationTestOrder()
+		order.DateCreated = time.Now().UTC().Add(time.Duration(i) * time.Hour).Truncate(time.Microsecond)
+		if err := repo.SaveOrder(ctx, order); err != nil {
+			t.Fatalf("SaveOrder failed: %v", err)
 		}
+		saved = append(saved, order)
 	}
 
-	if !found {
-		t.Errorf("Saved order not found in GetAllOrderd result")
+	orders, err := repo.GetRecentOrders(ctx, 2)
+	if err != nil {
+		t.Fatalf("GetRecentOrders failed: %v", err)
+	}
+	if len(orders) != 2 {
+		t.Fatalf("Expected 2 orders, got %d", len(orders))
+	}
+
+	// Порядок: сначала самый новый (+3 часа), потом +2 часа
+	if orders[0].OrderUID != saved[2].OrderUID || orders[1].OrderUID != saved[1].OrderUID {
+		t.Errorf("Unexpected order: got %s, %s", orders[0].OrderUID, orders[1].OrderUID)
+	}
+	// Товары подтянулись вторым запросом
+	if len(orders[0].Items) != len(saved[2].Items) {
+		t.Errorf("Expected %d items, got %d", len(saved[2].Items), len(orders[0].Items))
+	}
+	if orders[0].Delivery.Name != saved[2].Delivery.Name {
+		t.Errorf("Delivery not loaded")
 	}
 }

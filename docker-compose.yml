@@ -11,6 +11,7 @@ services:
     volumes:
       - pg_data:/var/lib/postgresql/data
       - ./migrations/001_init.up.sql:/docker-entrypoint-initdb.d/001_init.sql
+      - ./migrations/002_orders_date_created_idx.up.sql:/docker-entrypoint-initdb.d/002_orders_date_created_idx.sql
 
   zookeeper:
     image: confluentinc/cp-zookeeper:7.5.0

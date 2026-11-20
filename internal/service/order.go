@@ -74,14 +74,20 @@ func (s *orderService) GetOrder(ctx context.Context, orderUID string) (models.Or
 	return order, true, nil
 }
 
-// RestoreCache восстанавливает кэш из БД
-func (s *orderService) RestoreCache(ctx context.Context) error {
+// RestoreCache прогревает кэш последними limit заказами из БД.
+// Грузить всё бессмысленно: запись живёт в кэше только TTL (10 минут),
+// а в первые минуты после перезапуска спрашивают в основном свежие заказы.
+func (s *orderService) RestoreCache(ctx context.Context, limit int) error {
 	ctx, span := tracer.Start(ctx, "service.RestoreCache")
 	defer span.End()
 
-	orders, err := s.repo.GetAllOrders(ctx)
+	if limit <= 0 {
+		return nil // прогрев выключен
+	}
+
+	orders, err := s.repo.GetRecentOrders(ctx, limit)
 	if err != nil {
-		return fmt.Errorf("get all orders: %w", err)
+		return fmt.Errorf("get recent orders: %w", err)
 	}
 
 	for _, order := range orders {

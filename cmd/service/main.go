@@ -62,7 +62,7 @@ func main() {
 	orderService := service.NewOrderService(repo, orderCache)
 
 	// 5. Восстанавливаем кэш из БД
-	if err := orderService.RestoreCache(ctx); err != nil {
+	if err := orderService.RestoreCache(ctx, cfg.Cache.RestoreLimit); err != nil {
 		log.Printf("Warning: could not restore cache from DB: %v\n", err)
 	}
 

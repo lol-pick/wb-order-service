@@ -217,38 +217,103 @@ func (r *PostgresRepository) GetOrder(ctx context.Context, orderUID string) (mod
 	return order, nil
 }
 
-// GetAllOrders загружает все заказы из БД (для восстановления кэша при старте)
-func (r *PostgresRepository) GetAllOrders(ctx context.Context) ([]models.Order, error) {
-	ctx, span := tracer.Start(ctx, "postgres.GetAllOrders")
+// GetRecentOrders загружает последние limit заказов (по date_created) для прогрева кэша при старте.
+// Всего 2 запроса при любом limit: заказы с доставкой и оплатой одним JOIN, затем все их товары разом.
+// Раньше было 1 + 4*N запросов подряд под одним таймаутом — на больших объёмах прогрев не успевал.
+func (r *PostgresRepository) GetRecentOrders(ctx context.Context, limit int) ([]models.Order, error) {
+	ctx, span := tracer.Start(ctx, "postgres.GetRecentOrders")
 	defer span.End()
 
 	ctx, cancel := r.withTimeout(ctx)
 	defer cancel()
 
-	// 1. Получаем все order_uid
-	rows, err := r.pool.Query(ctx, "SELECT order_uid FROM orders")
+	// 1. Заказы + доставка + оплата одним запросом.
+	// Связи 1:1, поэтому JOIN не размножает строки: одна строка = один заказ.
+	// ORDER BY date_created DESC LIMIT — берём самые свежие; индекс idx_orders_date_created
+	// (миграция 002) позволяет не сортировать всю таблицу.
+	rows, err := r.pool.Query(ctx, `
+		SELECT o.order_uid, o.track_number, o.entry, o.locale,
+			o.internal_signature, o.customer_id, o.delivery_service,
+			o.shardkey, o.sm_id, o.date_created, o.oof_shard,
+			d.name, d.phone, d.zip, d.city, d.address, d.region, d.email,
+			p.transaction, p.request_id, p.currency, p.provider,
+			p.amount, p.payment_dt, p.bank, p.delivery_cost, p.goods_total, p.custom_fee
+		FROM orders o
+		JOIN deliveries d ON d.order_uid = o.order_uid
+		JOIN payments p ON p.order_uid = o.order_uid
+		ORDER BY o.date_created DESC
+		LIMIT $1`, limit,
+	)
 	if err != nil {
-		return nil, fmt.Errorf("select all order uids: %w", err)
+		return nil, fmt.Errorf("select recent orders: %w", err)
 	}
 	defer rows.Close()
 
-	var orderUIDs []string
+	orders := make([]models.Order, 0, limit)
 	for rows.Next() {
-		var uid string
-		if err := rows.Scan(&uid); err != nil {
-			return nil, fmt.Errorf("scan order uid: %w", err)
+		var o models.Order
+		err = rows.Scan(
+			&o.OrderUID, &o.TrackNumber, &o.Entry, &o.Locale,
+			&o.InternalSignature, &o.CustomerID, &o.DeliveryService,
+			&o.ShardKey, &o.SmID, &o.DateCreated, &o.OofShard,
+			&o.Delivery.Name, &o.Delivery.Phone, &o.Delivery.Zip,
+			&o.Delivery.City, &o.Delivery.Address, &o.Delivery.Region,
+			&o.Delivery.Email,
+			&o.Payment.Transaction, &o.Payment.RequestID,
+			&o.Payment.Currency, &o.Payment.Provider,
+			&o.Payment.Amount, &o.Payment.PaymentDT,
+			&o.Payment.Bank, &o.Payment.DeliveryCost,
+			&o.Payment.GoodsTotal, &o.Payment.CustomFee,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("scan recent order: %w", err)
 		}
-		orderUIDs = append(orderUIDs, uid)
+		orders = append(orders, o)
+	}
+	// rows.Err() — ошибка, случившаяся во время чтения (например, оборвалось соединение).
+	// Без этой проверки обрыв выглядел бы как «заказов меньше, чем есть».
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate recent orders: %w", err)
+	}
+	if len(orders) == 0 {
+		return orders, nil
 	}
 
-	// 2. Для каждого order_uid загружаем полный заказ
-	var orders []models.Order
-	for _, uid := range orderUIDs {
-		order, err := r.GetOrder(ctx, uid)
+	// 2. Все товары этих заказов одним запросом: order_uid = ANY($1) — «входит в массив».
+	uids := make([]string, len(orders))
+	idx := make(map[string]int, len(orders)) // order_uid -> позиция в orders
+	for i, o := range orders {
+		uids[i] = o.OrderUID
+		idx[o.OrderUID] = i
+	}
+
+	itemRows, err := r.pool.Query(ctx, `
+		SELECT order_uid, chrt_id, track_number, price, rid, name,
+			sale, size, total_price, nm_id, brand, status
+		FROM items WHERE order_uid = ANY($1)
+		ORDER BY id`, uids,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("select items of recent orders: %w", err)
+	}
+	defer itemRows.Close()
+
+	for itemRows.Next() {
+		var uid string
+		var item models.Item
+		err = itemRows.Scan(
+			&uid, &item.ChrtID, &item.TrackNumber, &item.Price, &item.RID,
+			&item.Name, &item.Sale, &item.Size, &item.TotalPrice,
+			&item.NmID, &item.Brand, &item.Status,
+		)
 		if err != nil {
-			return nil, fmt.Errorf("get order %s: %w", uid, err)
+			return nil, fmt.Errorf("scan item: %w", err)
 		}
-		orders = append(orders, order)
+		i := idx[uid]
+		orders[i].Items = append(orders[i].Items, item)
+	}
+	if err := itemRows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate items: %w", err)
 	}
 
 	return orders, nil

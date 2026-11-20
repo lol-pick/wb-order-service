@@ -48,6 +48,8 @@ type HTTPConfig struct {
 // CacheConfig — настройки кэша
 type CacheConfig struct {
 	TTL time.Duration
+	// RestoreLimit — сколько последних заказов загрузить в кэш при старте (0 — не прогревать)
+	RestoreLimit int
 }
 
 type TracingConfig struct {
@@ -88,7 +90,8 @@ func Load() (*Config, error) {
 			WriteTimeout: getEnvAsDuration("HTTP_WRITE_TIMEOUT", 30*time.Second),
 		},
 		Cache: CacheConfig{
-			TTL: getEnvAsDuration("CACHE_TTL", 10*time.Minute),
+			TTL:          getEnvAsDuration("CACHE_TTL", 10*time.Minute),
+			RestoreLimit: getEnvAsInt("CACHE_RESTORE_LIMIT", 1000),
 		},
 		Tracing: TracingConfig{
 			JaegerEndpoint: getEnv("JAEGER_ENDPOINT", "http://localhost:4318"),

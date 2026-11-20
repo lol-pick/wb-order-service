@@ -84,7 +84,9 @@ wb-order-service/
 │       └── tracing.go
 ├── migrations/
 │   ├── 001_init.up.sql       # Создание таблиц
-│   └── 001_init.down.sql     # Откат (удаление таблиц)
+│   ├── 001_init.down.sql     # Откат (удаление таблиц)
+│   ├── 002_orders_date_created_idx.up.sql   # Индекс для прогрева кэша
+│   └── 002_orders_date_created_idx.down.sql
 ├── web/
 │   └── index.html            # Веб-интерфейс
 ├── .env.example              # Шаблон переменных окружения
@@ -242,6 +244,7 @@ HTTP_WRITE_TIMEOUT=10s
 
 # Cache
 CACHE_TTL=10m
+CACHE_RESTORE_LIMIT=1000
 
 # Tracing
 JAEGER_ENDPOINT=http://localhost:4318
@@ -261,7 +264,7 @@ OTEL_SERVICE_NAME=order-service
 - Заказы хранятся в in-memory кэше (`sync.RWMutex` + `map`)
 - Записи автоматически инвалидируются по TTL
 - Фоновая горутина `cleanupLoop` удаляет просроченные записи
-- При перезапуске сервиса кэш восстанавливается из БД
+- При перезапуске кэш прогревается последними `CACHE_RESTORE_LIMIT` заказами (по умолчанию 1000) — двумя запросами к БД при любом объёме
 
 ### Надёжность
 - **At-least-once** (сообщение будет обработано хотя бы один раз): offset в Kafka коммитится только после того, как заказ сохранён в БД или записан в DLQ; если сервис остановить посреди обработки, сообщение будет прочитано повторно
