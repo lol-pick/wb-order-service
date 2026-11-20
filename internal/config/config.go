@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -61,11 +62,18 @@ type TracingConfig struct {
 	ServiceName    string
 }
 
-// ConnString возвращает строку подключения к PostgreSQL
+// ConnString возвращает строку подключения к PostgreSQL.
+// Собираем через net/url: логин и пароль экранируются. С простым Sprintf пароль
+// со спецсимволами (@, :, /) ломал бы разбор строки — например, «@» в пароле
+// драйвер принял бы за начало адреса хоста.
 func (p PostgresConfig) ConnString() string {
-	return fmt.Sprintf("postgres://%s:%s@%s:%d/%s",
-		p.User, p.Password, p.Host, p.Port, p.Database,
-	)
+	u := url.URL{
+		Scheme: "postgres",
+		User:   url.UserPassword(p.User, p.Password),
+		Host:   fmt.Sprintf("%s:%d", p.Host, p.Port),
+		Path:   "/" + p.Database,
+	}
+	return u.String()
 }
 
 // Load загружает конфигурацию из переменных окружения
