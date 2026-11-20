@@ -24,11 +24,26 @@ const (
 	commitTimeout = 5 * time.Second
 )
 
+// messageReader — то, что консьюмеру нужно от *kafkago.Reader.
+// Интерфейс объявлен здесь, у потребителя (идиома Go: «принимай интерфейсы»):
+// в проде это kafka-go Reader, в тестах — заглушка, и цикл чтения/коммита проверяется без Kafka.
+type messageReader interface {
+	FetchMessage(ctx context.Context) (kafkago.Message, error)
+	CommitMessages(ctx context.Context, msgs ...kafkago.Message) error
+	Close() error
+}
+
+// dlqSender — то, что консьюмеру нужно от *DLQWriter
+type dlqSender interface {
+	Send(ctx context.Context, msg kafkago.Message, reason string) error
+	Close() error
+}
+
 // Consumer - читатель сообщений из Kafka
 type Consumer struct {
-	reader  *kafkago.Reader
+	reader  messageReader
 	service service.OrderService
-	dlq     *DLQWriter
+	dlq     dlqSender
 }
 
 // NewConsumer создает нового Kafka-потребителя
