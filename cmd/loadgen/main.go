@@ -88,6 +88,7 @@ func runProduce(cfg *config.Config, args []string) error {
 	n := fs.Int("n", 10000, "сколько заказов отправить")
 	items := fs.Int("items", 3, "товаров в каждом заказе")
 	timeout := fs.Duration("timeout", 10*time.Minute, "сколько ждать сохранения всех заказов")
+	stall := fs.Duration("stall", 30*time.Second, "закончить ожидание, если столько времени нет прогресса")
 	_ = fs.Parse(args)
 
 	ctx := context.Background()
@@ -134,11 +135,14 @@ func runProduce(cfg *config.Config, args []string) error {
 	}
 	log.Printf("sent in %v, waiting for the consumer...", time.Since(start).Round(time.Millisecond))
 
-	// Опрашиваем БД, пока не появятся все N заказов.
+	// Опрашиваем БД, пока каждый заказ не окажется в БД или в DLQ.
 	// Ошибку запроса не считаем фатальной: в тесте надёжности БД специально останавливают,
 	// и loadgen должен дождаться её возвращения, а не упасть. pgxpool сам переподключится.
+	// Если прогресса нет дольше stall — дальше ждать бессмысленно, печатаем итог.
 	deadline := time.Now().Add(*timeout)
+	lastProgress := time.Now()
 	var stored int
+	var inDLQ int64
 	for {
 		var cnt int
 		err := pool.QueryRow(ctx,
@@ -146,14 +150,29 @@ func runProduce(cfg *config.Config, args []string) error {
 		if err != nil {
 			log.Printf("  count failed (DB unavailable?): %v", err)
 		} else {
-			stored = cnt
-			if stored >= *n {
-				break
+			if cnt != stored {
+				lastProgress = time.Now()
 			}
-			log.Printf("  stored %d / %d", stored, *n)
+			stored = cnt
 		}
-		if time.Now().After(deadline) {
+		if dlqErr == nil {
+			if after, err := topicSize(ctx, cfg.Kafka.Brokers[0], cfg.Kafka.DLQTopic); err == nil {
+				if after-dlqBefore != inDLQ {
+					lastProgress = time.Now()
+				}
+				inDLQ = after - dlqBefore
+			}
+		}
+
+		if stored+int(inDLQ) >= *n {
 			break
+		}
+		if time.Now().After(deadline) || time.Since(lastProgress) > *stall {
+			log.Printf("  no progress, stop waiting")
+			break
+		}
+		if err == nil {
+			log.Printf("  stored %d / %d (DLQ: %d)", stored, *n, inDLQ)
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
@@ -172,15 +191,17 @@ func runProduce(cfg *config.Config, args []string) error {
 	fmt.Printf("orders in DB:     %d\n", stored)
 	fmt.Printf("items in DB:      %d (expected %d)\n", storedItems, *n**items)
 	if dlqErr == nil {
-		if dlqAfter, err := topicSize(ctx, cfg.Kafka.Brokers[0], cfg.Kafka.DLQTopic); err == nil {
-			fmt.Printf("sent to DLQ:      %d\n", dlqAfter-dlqBefore)
-		}
+		fmt.Printf("sent to DLQ:      %d\n", inDLQ)
+		// Потерян = нет ни в БД, ни в DLQ
+		fmt.Printf("lost:             %d\n", *n-stored-int(inDLQ))
+	} else {
+		fmt.Printf("sent to DLQ:      unknown (%v)\n", dlqErr)
 	}
 	fmt.Printf("elapsed:          %v\n", elapsed.Round(time.Millisecond))
 	fmt.Printf("throughput:       %.0f orders/s\n", float64(stored)/elapsed.Seconds())
 
-	if stored < *n {
-		return fmt.Errorf("timeout: only %d of %d orders stored", stored, *n)
+	if stored+int(inDLQ) < *n {
+		return fmt.Errorf("only %d of %d orders stored, %d in DLQ", stored, *n, inDLQ)
 	}
 	return nil
 }
