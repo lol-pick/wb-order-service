@@ -36,6 +36,8 @@ type KafkaConfig struct {
 	MinBytes int
 	MaxBytes int
 	MaxWait  time.Duration
+	// CommitInterval — как часто подтверждать оффсеты в фоне (0 — синхронно после каждого сообщения)
+	CommitInterval time.Duration
 }
 
 // HTTPConfig — настройки HTTP-сервера
@@ -78,13 +80,14 @@ func Load() (*Config, error) {
 			Timeout:  getEnvAsDuration("POSTGRES_TIMEOUT", 5*time.Second),
 		},
 		Kafka: KafkaConfig{
-			Brokers:  getEnvAsSlice("KAFKA_BROKERS", []string{"localhost:9092"}),
-			Topic:    getEnv("KAFKA_TOPIC", "orders"),
-			GroupID:  getEnv("KAFKA_GROUP_ID", "order-service"),
-			DLQTopic: getEnv("KAFKA_DLQ_TOPIC", "orders-dlq"),
-			MinBytes: getEnvAsInt("KAFKA_MIN_BYTES", 1),
-			MaxBytes: getEnvAsInt("KAFKA_MAX_BYTES", 10485760),
-			MaxWait:  getEnvAsDuration("KAFKA_MAX_WAIT", 1*time.Second),
+			Brokers:        getEnvAsSlice("KAFKA_BROKERS", []string{"localhost:9092"}),
+			Topic:          getEnv("KAFKA_TOPIC", "orders"),
+			GroupID:        getEnv("KAFKA_GROUP_ID", "order-service"),
+			DLQTopic:       getEnv("KAFKA_DLQ_TOPIC", "orders-dlq"),
+			MinBytes:       getEnvAsInt("KAFKA_MIN_BYTES", 1),
+			MaxBytes:       getEnvAsInt("KAFKA_MAX_BYTES", 10485760),
+			MaxWait:        getEnvAsDuration("KAFKA_MAX_WAIT", 1*time.Second),
+			CommitInterval: getEnvAsDuration("KAFKA_COMMIT_INTERVAL", 1*time.Second),
 		},
 		HTTP: HTTPConfig{
 			Port:         getEnvAsInt("HTTP_PORT", 8081),

@@ -34,14 +34,19 @@ type Consumer struct {
 // NewConsumer создает нового Kafka-потребителя
 func NewConsumer(cfg config.KafkaConfig, svc service.OrderService) *Consumer {
 	reader := kafkago.NewReader(kafkago.ReaderConfig{
-		Brokers:        cfg.Brokers,
-		Topic:          cfg.Topic,
-		GroupID:        cfg.GroupID,
-		MinBytes:       cfg.MinBytes,
-		MaxBytes:       cfg.MaxBytes,
-		MaxWait:        cfg.MaxWait,
-		StartOffset:    kafkago.FirstOffset,
-		CommitInterval: 0,
+		Brokers:     cfg.Brokers,
+		Topic:       cfg.Topic,
+		GroupID:     cfg.GroupID,
+		MinBytes:    cfg.MinBytes,
+		MaxBytes:    cfg.MaxBytes,
+		MaxWait:     cfg.MaxWait,
+		StartOffset: kafkago.FirstOffset,
+		// CommitInterval > 0: CommitMessages не ждёт ответа Kafka, а только запоминает оффсет;
+		// библиотека подтверждает последний оффсет в фоне раз в интервал и при Close.
+		// Раньше (0) каждый заказ ждал отдельного синхронного коммита — лишний round trip.
+		// Цена: при аварийном падении (kill -9) заказы за последний интервал придут повторно —
+		// их отсеет защита от дублей (ErrOrderExists). При штатной остановке Close докоммитит всё.
+		CommitInterval: cfg.CommitInterval,
 	})
 
 	dlq := NewDLQWriter(cfg.Brokers, cfg.DLQTopic)
@@ -100,6 +105,7 @@ func (c *Consumer) readAndProcess(ctx context.Context) {
 	}
 
 	// Заказ уже сохранён — оффсет нужно подтвердить, даже если пришёл сигнал остановки.
+	// При CommitInterval > 0 вызов только ставит оффсет в очередь на фоновый коммит.
 	// С отменённым ctx коммит сразу упал бы, и после перезапуска сообщение пришло бы повторно.
 	// context.WithoutCancel (Go 1.21+) — копия ctx без отмены; свой таймаут, чтобы не зависнуть.
 	commitCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), commitTimeout)
