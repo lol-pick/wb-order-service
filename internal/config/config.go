@@ -48,6 +48,8 @@ type HTTPConfig struct {
 // CacheConfig — настройки кэша
 type CacheConfig struct {
 	TTL time.Duration
+	// MaxSize — максимум заказов в кэше; при переполнении вытесняется самый старый
+	MaxSize int
 	// RestoreLimit — сколько последних заказов загрузить в кэш при старте (0 — не прогревать)
 	RestoreLimit int
 }
@@ -91,6 +93,7 @@ func Load() (*Config, error) {
 		},
 		Cache: CacheConfig{
 			TTL:          getEnvAsDuration("CACHE_TTL", 10*time.Minute),
+			MaxSize:      getEnvAsInt("CACHE_MAX_SIZE", 10000),
 			RestoreLimit: getEnvAsInt("CACHE_RESTORE_LIMIT", 1000),
 		},
 		Tracing: TracingConfig{
@@ -99,7 +102,24 @@ func Load() (*Config, error) {
 		},
 	}
 
+	if err := cfg.validate(); err != nil {
+		return nil, err
+	}
+
 	return cfg, nil
+}
+
+// validate проверяет значения, при которых сервис заведомо работает неправильно
+func (c *Config) validate() error {
+	if c.Cache.MaxSize <= 0 {
+		return fmt.Errorf("CACHE_MAX_SIZE must be > 0, got %d", c.Cache.MaxSize)
+	}
+	if c.Cache.RestoreLimit < 0 || c.Cache.RestoreLimit > c.Cache.MaxSize {
+		// Иначе прогрев сам вытеснил бы из кэша часть только что загруженных заказов
+		return fmt.Errorf("CACHE_RESTORE_LIMIT must be in [0, CACHE_MAX_SIZE=%d], got %d",
+			c.Cache.MaxSize, c.Cache.RestoreLimit)
+	}
+	return nil
 }
 
 // getEnv читает переменную окружения с дефолтным значением

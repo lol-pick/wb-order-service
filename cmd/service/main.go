@@ -56,7 +56,8 @@ func main() {
 	log.Println("Connected to PostgreSQL")
 
 	// 3.Создаем кэш c TTL
-	orderCache := cache.NewOrderCache(cfg.Cache.TTL)
+	orderCache := cache.NewOrderCache(cfg.Cache.TTL, cfg.Cache.MaxSize)
+	defer orderCache.Close() // останавливаем фоновую очистку кэша
 
 	// 4. Создаем сервисный слой
 	orderService := service.NewOrderService(repo, orderCache)
