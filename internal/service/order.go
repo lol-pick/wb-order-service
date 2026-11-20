@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 
+	"wb-order-service/internal/metrics"
 	"wb-order-service/internal/models"
 
 	"go.opentelemetry.io/otel"
@@ -53,11 +54,14 @@ func (s *orderService) GetOrder(ctx context.Context, orderUID string) (models.Or
 	// 1. Ищем в кэше
 	order, found := s.cache.Get(orderUID)
 	if found {
+		metrics.RecordCacheHit()
 		log.Printf("Cache HIT for order %s\n", orderUID)
 		return order, true, nil
 	}
 
-	// 2. Ищем в БД
+	// 2. Ищем в БД. Промах кэша считаем здесь, до запроса:
+	// найдётся заказ в БД или нет — к эффективности кэша это не относится.
+	metrics.RecordCacheMiss()
 	log.Printf("Cache MISS for order %s, querying DB\n", orderUID)
 	order, err := s.repo.GetOrder(ctx, orderUID)
 	if err != nil {

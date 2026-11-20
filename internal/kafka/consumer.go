@@ -11,7 +11,7 @@ import (
 	kafkago "github.com/segmentio/kafka-go"
 
 	"wb-order-service/internal/config"
-	"wb-order-service/internal/handler"
+	"wb-order-service/internal/metrics"
 	"wb-order-service/internal/models"
 	"wb-order-service/internal/service"
 )
@@ -117,7 +117,7 @@ func (c *Consumer) handle(ctx context.Context, msg kafkago.Message) error {
 	order, err := decodeOrder(msg.Value)
 	if err != nil {
 		// Битое сообщение: повторять бессмысленно, сразу в DLQ
-		handler.RecordKafkaMessage("failed")
+		metrics.RecordKafkaMessage("failed")
 		log.Printf("Invalid message: %v\n", err)
 		return c.sendToDLQ(ctx, msg, err)
 	}
@@ -135,7 +135,7 @@ func (c *Consumer) handle(ctx context.Context, msg kafkago.Message) error {
 		return err
 	})
 	if err == nil {
-		handler.RecordKafkaMessage("processed")
+		metrics.RecordKafkaMessage("processed")
 		return nil
 	}
 	if ctx.Err() != nil {
@@ -143,7 +143,7 @@ func (c *Consumer) handle(ctx context.Context, msg kafkago.Message) error {
 	}
 
 	// БД недоступна дольше, чем длятся все повторы: откладываем сообщение в DLQ
-	handler.RecordKafkaMessage("failed")
+	metrics.RecordKafkaMessage("failed")
 	log.Printf("Save failed after %d attempts: %v\n", maxSaveAttempts, err)
 	return c.sendToDLQ(ctx, msg, err)
 }
@@ -157,7 +157,7 @@ func (c *Consumer) sendToDLQ(ctx context.Context, msg kafkago.Message, reason er
 	if err != nil {
 		return err
 	}
-	handler.RecordKafkaMessage("dlq")
+	metrics.RecordKafkaMessage("dlq")
 	return nil
 }
 

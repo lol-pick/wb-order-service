@@ -15,6 +15,7 @@ import (
 	"wb-order-service/internal/config"
 	"wb-order-service/internal/handler"
 	kafkaconsumer "wb-order-service/internal/kafka"
+	"wb-order-service/internal/metrics"
 	"wb-order-service/internal/repository"
 	"wb-order-service/internal/service"
 	"wb-order-service/internal/tracing"
@@ -74,7 +75,8 @@ func run() error {
 
 	// 3.Создаем кэш c TTL
 	orderCache := cache.NewOrderCache(cfg.Cache.TTL, cfg.Cache.MaxSize)
-	defer orderCache.Close() // останавливаем фоновую очистку кэша
+	defer orderCache.Close()                       // останавливаем фоновую очистку кэша
+	metrics.RegisterOrdersInCache(orderCache.Size) // orders_in_cache считается в момент сбора метрик
 
 	// 4. Создаем сервисный слой
 	orderService := service.NewOrderService(repo, orderCache)
