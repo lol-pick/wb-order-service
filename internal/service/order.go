@@ -41,8 +41,6 @@ func (s *orderService) SaveOrder(ctx context.Context, order models.Order) error 
 
 	// Кэшируем
 	s.cache.Set(order)
-
-	log.Printf("Order %s saved and cached\n", order.OrderUID)
 	return nil
 }
 
@@ -55,14 +53,12 @@ func (s *orderService) GetOrder(ctx context.Context, orderUID string) (models.Or
 	order, found := s.cache.Get(orderUID)
 	if found {
 		metrics.RecordCacheHit()
-		log.Printf("Cache HIT for order %s\n", orderUID)
 		return order, true, nil
 	}
 
 	// 2. Ищем в БД. Промах кэша считаем здесь, до запроса:
 	// найдётся заказ в БД или нет — к эффективности кэша это не относится.
 	metrics.RecordCacheMiss()
-	log.Printf("Cache MISS for order %s, querying DB\n", orderUID)
 	order, err := s.repo.GetOrder(ctx, orderUID)
 	if err != nil {
 		// Заказа нет — это не ошибка сервиса, а обычный ответ «не найден» (404).

@@ -94,8 +94,9 @@ func (c *Consumer) readAndProcess(ctx context.Context) {
 		return
 	}
 
-	log.Printf("Received message from Kafka: offset = %d, key = %s\n",
-		msg.Offset, string(msg.Key))
+	// Успешная обработка не логируется: строка лога на каждое сообщение при сотнях сообщений
+	// в секунду сама становится заметной нагрузкой. Поток виден по метрике kafka_messages_total,
+	// путь отдельного заказа — в трейсах Jaeger. В лог пишем только ошибки и важные события.
 
 	if err := c.handle(ctx, msg); err != nil {
 		// Сюда попадаем только при остановке сервиса.
