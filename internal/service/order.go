@@ -41,8 +41,6 @@ func (s *orderService) SaveOrder(ctx context.Context, order models.Order) error 
 
 	// Кэшируем
 	s.cache.Set(order)
-
-	log.Printf("Order %s saved and cached\n", order.OrderUID)
 	return nil
 }
 
@@ -55,22 +53,17 @@ func (s *orderService) GetOrder(ctx context.Context, orderUID string) (models.Or
 	order, found := s.cache.Get(orderUID)
 	if found {
 		metrics.RecordCacheHit()
-		log.Printf("Cache HIT for order %s\n", orderUID)
 		return order, true, nil
 	}
 
 	// 2. Ищем в БД. Промах кэша считаем здесь, до запроса:
 	// найдётся заказ в БД или нет — к эффективности кэша это не относится.
 	metrics.RecordCacheMiss()
-	log.Printf("Cache MISS for order %s, querying DB\n", orderUID)
 	order, err := s.repo.GetOrder(ctx, orderUID)
 	if err != nil {
-		// Заказа нет — это не ошибка сервиса, а обычный ответ «не найден» (404).
-		// errors.Is сравнивает с sentinel по всей цепочке обёрток (%w), а не по тексту.
 		if errors.Is(err, models.ErrOrderNotFound) {
 			return models.Order{}, false, nil
 		}
-		// Иначе - реальная ошибка БД
 		return models.Order{}, false, fmt.Errorf("get from repository: %w", err)
 	}
 
@@ -80,8 +73,6 @@ func (s *orderService) GetOrder(ctx context.Context, orderUID string) (models.Or
 }
 
 // RestoreCache прогревает кэш последними limit заказами из БД.
-// Грузить всё бессмысленно: запись живёт в кэше только TTL (10 минут),
-// а в первые минуты после перезапуска спрашивают в основном свежие заказы.
 func (s *orderService) RestoreCache(ctx context.Context, limit int) error {
 	ctx, span := tracer.Start(ctx, "service.RestoreCache")
 	defer span.End()

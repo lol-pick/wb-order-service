@@ -23,9 +23,6 @@ import (
 	"github.com/joho/godotenv"
 )
 
-// main только запускает run и выставляет код выхода.
-// log.Fatal/os.Exit завершают процесс сразу и НЕ выполняют defer'ы, поэтому они допустимы
-// лишь здесь, когда все defer'ы run уже отработали.
 func main() {
 	if err := run(); err != nil {
 		log.Printf("Service stopped with error: %v\n", err)
@@ -33,8 +30,6 @@ func main() {
 	}
 }
 
-// run собирает и запускает сервис. Любая ошибка возвращается наверх,
-// а не обрывает процесс, — так все defer'ы (закрытие БД, консьюмера, трейсера) выполнятся.
 func run() error {
 	// Загружаем .env файл
 	_ = godotenv.Load()
@@ -97,8 +92,6 @@ func run() error {
 		}
 	}()
 
-	// consumerDone закроется, когда Run вернётся, — так main узнает,
-	// что консьюмер доделал текущее сообщение и больше не трогает БД.
 	consumerDone := make(chan struct{})
 	go func() {
 		defer close(consumerDone)
@@ -117,19 +110,15 @@ func run() error {
 		WriteTimeout: cfg.HTTP.WriteTimeout,
 	}
 
-	// 8. Запускаем HTTP-сервер в отдельной горутине.
-	// Ошибку не роняем через log.Fatal, а отдаём в канал: main решит, что делать, и выполнит defer'ы.
-	// Буфер 1 — горутина сможет записать ошибку и завершиться, даже если её никто не читает.
 	serverErr := make(chan error, 1)
 	go func() {
 		log.Printf("HTTP server started on http://localhost:%d\n", cfg.HTTP.Port)
-		// errors.Is, а не !=: ErrServerClosed — sentinel, его могут обернуть
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			serverErr <- err
 		}
 	}()
 
-	// 9. Graceful shutdown - ждем сигнал завершения ИЛИ падение HTTP-сервера (например, порт занят)
+	// 9. Graceful shutdown - ждем сигнал завершения или падение HTTP-сервера
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 
@@ -142,20 +131,16 @@ func run() error {
 		runErr = fmt.Errorf("http server: %w", err)
 	}
 
-	// 10. Останавливаем всё. Порядок важен:
-	// сначала перестаём принимать работу (HTTP и Kafka), ждём, пока текущая доделается,
-	// и только потом закрываем консьюмер и пул БД (это делают defer'ы выше, в обратном порядке).
+	// 10. Остановка
 	kafkaCancel()
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(ctx, cfg.HTTP.WriteTimeout)
 	defer shutdownCancel()
 
-	// Shutdown перестаёт принимать новые соединения и ждёт завершения текущих запросов
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		log.Printf("HTTP server shutdown error: %v\n", err)
 	}
 
-	// Ждём консьюмер, но не бесконечно: общий лимит на остановку — shutdownCtx
 	select {
 	case <-consumerDone:
 		log.Println("Kafka consumer finished")

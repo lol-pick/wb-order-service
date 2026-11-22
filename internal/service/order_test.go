@@ -14,8 +14,7 @@ import (
 
 // mockRepo - мок репозитория
 type mockRepo struct {
-	orders map[string]models.Order
-	// Настраиваемые ошибки
+	orders    map[string]models.Order
 	saveError error
 	getError  error
 }
@@ -31,12 +30,10 @@ func (m *mockRepo) SaveOrder(_ context.Context, order models.Order) error {
 	if m.saveError != nil {
 		return m.saveError
 	}
-	// Имитируем Primary Key constraint
 	if _, exists := m.orders[order.OrderUID]; exists {
 		return fmt.Errorf("duplicate key: %s", order.OrderUID)
 	}
 
-	// Сохраняем в map (insert bd)
 	m.orders[order.OrderUID] = order
 	return nil
 }
@@ -48,7 +45,6 @@ func (m *mockRepo) GetOrder(_ context.Context, uid string) (models.Order, error)
 	}
 	order, ok := m.orders[uid]
 	if !ok {
-		// Как настоящий репозиторий: обёрнутый sentinel
 		return models.Order{}, fmt.Errorf("get %s: %w", uid, models.ErrOrderNotFound)
 	}
 	return order, nil
@@ -223,7 +219,7 @@ func TestSaveOrder_Duplication(t *testing.T) {
 	// Второй раз сохраняем
 	err = svc.SaveOrder(context.Background(), order)
 
-	// Проверка - должна быть ошибка дубликата
+	// Проверка
 	if err == nil {
 		t.Fatalf("Expected dupliicate error, got hil")
 	}

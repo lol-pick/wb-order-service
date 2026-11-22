@@ -24,24 +24,41 @@ const (
 	commitTimeout = 5 * time.Second
 )
 
+// messageReader — то, что консьюмеру нужно от *kafkago.Reader.
+type messageReader interface {
+	FetchMessage(ctx context.Context) (kafkago.Message, error)
+	CommitMessages(ctx context.Context, msgs ...kafkago.Message) error
+	Close() error
+}
+
+// dlqSender — то, что консьюмеру нужно от *DLQWriter
+type dlqSender interface {
+	Send(ctx context.Context, msg kafkago.Message, reason string) error
+	Close() error
+}
+
 // Consumer - читатель сообщений из Kafka
 type Consumer struct {
-	reader  *kafkago.Reader
+	reader  messageReader
 	service service.OrderService
-	dlq     *DLQWriter
+	dlq     dlqSender
 }
 
 // NewConsumer создает нового Kafka-потребителя
 func NewConsumer(cfg config.KafkaConfig, svc service.OrderService) *Consumer {
 	reader := kafkago.NewReader(kafkago.ReaderConfig{
-		Brokers:        cfg.Brokers,
-		Topic:          cfg.Topic,
-		GroupID:        cfg.GroupID,
-		MinBytes:       cfg.MinBytes,
-		MaxBytes:       cfg.MaxBytes,
-		MaxWait:        cfg.MaxWait,
-		StartOffset:    kafkago.FirstOffset,
-		CommitInterval: 0,
+		Brokers:     cfg.Brokers,
+		Topic:       cfg.Topic,
+		GroupID:     cfg.GroupID,
+		MinBytes:    cfg.MinBytes,
+		MaxBytes:    cfg.MaxBytes,
+		MaxWait:     cfg.MaxWait,
+		StartOffset: kafkago.FirstOffset,
+		// CommitInterval > 0: CommitMessages не ждёт ответа Kafka, а только запоминает оффсет;
+		// библиотека подтверждает последний оффсет в фоне раз в интервал и при Close.
+		// При аварийном падении (kill -9) заказы за последний интервал придут повторно —
+		// их отсеет защита от дублей (ErrOrderExists). При штатной остановке Close докоммитит всё.
+		CommitInterval: cfg.CommitInterval,
 	})
 
 	dlq := NewDLQWriter(cfg.Brokers, cfg.DLQTopic)
@@ -53,7 +70,7 @@ func NewConsumer(cfg config.KafkaConfig, svc service.OrderService) *Consumer {
 	}
 }
 
-// Run запускает чтение сообщений (блокирующий метод)
+// Run запускает чтение сообщений
 func (c *Consumer) Run(ctx context.Context) {
 	log.Println("Kafka consumer started, waiting for messages...")
 	for {
@@ -89,8 +106,9 @@ func (c *Consumer) readAndProcess(ctx context.Context) {
 		return
 	}
 
-	log.Printf("Received message from Kafka: offset = %d, key = %s\n",
-		msg.Offset, string(msg.Key))
+	// Успешная обработка не логируется: строка лога на каждое сообщение при сотнях сообщений
+	// в секунду сама становится заметной нагрузкой. Поток виден по метрике kafka_messages_total,
+	// путь отдельного заказа — в трейсах Jaeger. В лог пишем только ошибки и важные события.
 
 	if err := c.handle(ctx, msg); err != nil {
 		// Сюда попадаем только при остановке сервиса.
@@ -100,8 +118,8 @@ func (c *Consumer) readAndProcess(ctx context.Context) {
 	}
 
 	// Заказ уже сохранён — оффсет нужно подтвердить, даже если пришёл сигнал остановки.
+	// При CommitInterval > 0 вызов только ставит оффсет в очередь на фоновый коммит.
 	// С отменённым ctx коммит сразу упал бы, и после перезапуска сообщение пришло бы повторно.
-	// context.WithoutCancel (Go 1.21+) — копия ctx без отмены; свой таймаут, чтобы не зависнуть.
 	commitCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), commitTimeout)
 	defer cancel()
 	if err := c.reader.CommitMessages(commitCtx, msg); err != nil {
@@ -122,13 +140,12 @@ func (c *Consumer) handle(ctx context.Context, msg kafkago.Message) error {
 
 	// Начатую попытку сохранения доводим до конца даже при остановке сервиса:
 	// SaveOrder получает ctx без отмены (таймаут на запросы ставит репозиторий).
-	// А ожидание между повторами прерывается по ctx — новых попыток после сигнала не будет.
 	saveCtx := context.WithoutCancel(ctx)
 
 	// Ошибки делятся на два вида:
 	//   - временные (БД недоступна, таймаут) — повторяем БЕЗ ограничения, пока БД не вернётся.
 	//     DLQ для них не подходит: при упавшей БД падали бы все сообщения подряд,
-	//     и рабочие заказы оседали бы в DLQ, где их никто не переобработает;
+	//     и рабочие заказы оседали бы в DLQ;
 	//   - постоянные (ErrInvalidOrder: БД отвергла сами данные) — повтор не поможет, сразу в DLQ.
 	// Пока идут повторы, оффсет не коммитится: после перезапуска сервис продолжит с этого же сообщения.
 	var invalidErr error
@@ -164,7 +181,7 @@ func (c *Consumer) handle(ctx context.Context, msg kafkago.Message) error {
 }
 
 // sendToDLQ повторяет отправку в DLQ, пока она не пройдёт или сервис не остановят.
-// Пока DLQ недоступна, консьюмер ждёт: лучше остановиться, чем потерять сообщение.
+// Пока DLQ недоступна, консьюмер ждёт.
 func (c *Consumer) sendToDLQ(ctx context.Context, msg kafkago.Message, reason error) error {
 	err := retry(ctx, 0, func() error {
 		return c.dlq.Send(ctx, msg, reason.Error())
@@ -177,7 +194,7 @@ func (c *Consumer) sendToDLQ(ctx context.Context, msg kafkago.Message, reason er
 }
 
 // retry вызывает fn, пока она не вернёт nil, пока не кончатся попытки
-// или пока не отменят ctx. attempts == 0 означает «повторять без ограничения».
+// или пока не отменят ctx.
 // Пауза между попытками растёт вдвое, но не больше retryMaxDelay.
 func retry(ctx context.Context, attempts int, fn func() error) error {
 	delay := retryBaseDelay

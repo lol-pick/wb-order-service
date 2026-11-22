@@ -38,9 +38,6 @@ type OrderCache struct {
 	closeOnce sync.Once     // защищает от паники при повторном close(done)
 }
 
-// NewOrderCache создает новый пустой кэш.
-// maxSize — максимум записей; при переполнении вытесняется самая старая (maxSize <= 0 — без лимита).
-// После использования нужно вызвать Close, чтобы остановить фоновую очистку.
 func NewOrderCache(ttl time.Duration, maxSize int) *OrderCache {
 	cache := &OrderCache{
 		items:   make(map[string]*cacheEntry),
@@ -86,7 +83,6 @@ func (c *OrderCache) Set(order models.Order) {
 }
 
 // Get - возвращает заказ по order_uid если он есть и не просрочен.
-// Только читает, поэтому берёт RLock: параллельные Get не блокируют друг друга.
 func (c *OrderCache) Get(orderUID string) (models.Order, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -156,14 +152,14 @@ func (c *OrderCache) cleanup() {
 		if !now.After(c.items[uid].expiresAt) {
 			break
 		}
-		next := elem.Next() // запоминаем до Remove: после удаления elem.Next() вернёт nil
+		next := elem.Next()
 		c.order.Remove(elem)
 		delete(c.items, uid)
 		elem = next
 	}
 }
 
-// removeOldest удаляет первую запись очереди. Вызывать под c.mu.Lock.
+// removeOldest удаляет первую запись очереди.
 func (c *OrderCache) removeOldest() {
 	front := c.order.Front()
 	if front == nil {

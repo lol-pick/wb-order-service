@@ -43,13 +43,10 @@ func (r *PostgresRepository) Close() {
 	r.pool.Close()
 }
 
-// writeErr оборачивает ошибку записи и помечает «плохие данные» sentinel-ошибкой ErrInvalidOrder.
-// Коды PostgreSQL (SQLSTATE) группируются по первым двум символам — классу:
+// writeErr оборачивает ошибку записи
+// Коды PostgreSQL группируются по первым двум символам — классу:
 //   - 22 (data exception) — значение не подходит под тип: строка длиннее varchar(N), переполнение числа;
 //   - 23 (integrity constraint violation) — нарушено ограничение: NOT NULL, CHECK, внешний ключ.
-//
-// Такие ошибки повторять бессмысленно. Всё остальное (нет соединения, таймаут, БД перезапускается)
-// считается временным, и консьюмер будет повторять, пока БД не вернётся.
 func writeErr(op string, err error) error {
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) && len(pgErr.Code) == 5 {
@@ -71,7 +68,6 @@ func (r *PostgresRepository) SaveOrder(ctx context.Context, order models.Order) 
 	ctx, span := tracer.Start(ctx, "postgres.SaveOrder")
 	defer span.End()
 
-	//Начинаем транзакцию
 	ctx, cancel := r.withTimeout(ctx)
 	defer cancel()
 
@@ -79,12 +75,17 @@ func (r *PostgresRepository) SaveOrder(ctx context.Context, order models.Order) 
 	if err != nil {
 		return fmt.Errorf("begin transaction: %w", err)
 	}
-	// Если произойдет ошибка - откатим все изменения
+	// Если произойдет ошибка - откатим все изменения (после Commit это no-op)
 	defer func() {
 		_ = tx.Rollback(context.Background())
 	}()
-	// 1. Вставляем таблицу orders
-	_, err = tx.Exec(ctx, `
+
+	// Все вставки отправляем ОДНИМ пакетом (pgx.Batch): pgx пишет запросы в соединение подряд,
+	// не дожидаясь ответа на каждый (pipelining), и читает ответы потом.
+	batch := &pgx.Batch{}
+
+	// 1. orders
+	batch.Queue(`
 		INSERT INTO orders (
 			order_uid, track_number, entry, locale,
 			internal_signature, customer_id, delivery_service,
@@ -94,17 +95,9 @@ func (r *PostgresRepository) SaveOrder(ctx context.Context, order models.Order) 
 		order.InternalSignature, order.CustomerID, order.DeliveryService,
 		order.ShardKey, order.SmID, order.DateCreated, order.OofShard,
 	)
-	if err != nil {
-		// 23505 — код PostgreSQL unique_violation: заказ с таким order_uid уже есть
-		var pgErr *pgconn.PgError
-		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
-			return models.ErrOrderExists
-		}
-		return writeErr("insert order", err)
-	}
 
-	// 2. Вставляем в таблицу deliveries
-	_, err = tx.Exec(ctx, `
+	// 2. deliveries
+	batch.Queue(`
 		INSERT INTO deliveries (
 			order_uid, name, phone, zip, city, address, region, email
 		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
@@ -113,12 +106,9 @@ func (r *PostgresRepository) SaveOrder(ctx context.Context, order models.Order) 
 		order.Delivery.City, order.Delivery.Address, order.Delivery.Region,
 		order.Delivery.Email,
 	)
-	if err != nil {
-		return writeErr("insert delivery", err)
-	}
 
-	// 3. Вставляем в таблицу payments
-	_, err = tx.Exec(ctx, `
+	// 3. payments
+	batch.Queue(`
 		INSERT INTO payments (
 			order_uid, transaction, request_id, currency, provider,
 			amount, payment_dt, bank, delivery_cost, goods_total, custom_fee
@@ -130,13 +120,10 @@ func (r *PostgresRepository) SaveOrder(ctx context.Context, order models.Order) 
 		order.Payment.Bank, order.Payment.DeliveryCost,
 		order.Payment.GoodsTotal, order.Payment.CustomFee,
 	)
-	if err != nil {
-		return writeErr("insert payment", err)
-	}
 
-	// 4. Вставляем каждый товар в таблицу items
-	for i, item := range order.Items {
-		_, err = tx.Exec(ctx, `
+	// 4. items — по запросу на товар, но все в том же пакете
+	for _, item := range order.Items {
+		batch.Queue(`
 			INSERT INTO items (
 				order_uid, chrt_id, track_number, price, rid, name,
 				sale, size, total_price, nm_id, brand, status
@@ -146,16 +133,49 @@ func (r *PostgresRepository) SaveOrder(ctx context.Context, order models.Order) 
 			item.Name, item.Sale, item.Size, item.TotalPrice,
 			item.NmID, item.Brand, item.Status,
 		)
-		if err != nil {
-			return writeErr(fmt.Sprintf("insert item %d", i), err)
-		}
 	}
 
-	// 5. Фиксируем транзакцию — все 4 вставки применяются РАЗОМ
+	if err := execBatch(ctx, tx, batch); err != nil {
+		return err
+	}
+
+	// 5. Фиксируем транзакцию — все вставки применяются РАЗОМ
 	if err := tx.Commit(ctx); err != nil {
 		return writeErr("commit transaction", err)
 	}
 	return nil
+}
+
+// execBatch отправляет пакет и читает результаты строго по порядку постановки в очередь.
+func execBatch(ctx context.Context, tx pgx.Tx, batch *pgx.Batch) error {
+	br := tx.SendBatch(ctx, batch)
+	defer func() { _ = br.Close() }()
+
+	for i := 0; i < batch.Len(); i++ {
+		if _, err := br.Exec(); err != nil {
+			// 23505 — unique_violation: заказ с таким order_uid уже есть
+			var pgErr *pgconn.PgError
+			if i == 0 && errors.As(err, &pgErr) && pgErr.Code == "23505" {
+				return models.ErrOrderExists
+			}
+			return writeErr(batchStepName(i), err)
+		}
+	}
+	return nil
+}
+
+// batchStepName — название шага пакета для текста ошибки
+func batchStepName(i int) string {
+	switch i {
+	case 0:
+		return "insert order"
+	case 1:
+		return "insert delivery"
+	case 2:
+		return "insert payment"
+	default:
+		return fmt.Sprintf("insert item %d", i-3)
+	}
 }
 
 // GetOrder загружает заказ из БД по order_uid
@@ -180,8 +200,6 @@ func (r *PostgresRepository) GetOrder(ctx context.Context, orderUID string) (mod
 		&order.ShardKey, &order.SmID, &order.DateCreated, &order.OofShard,
 	)
 	if err != nil {
-		// pgx.ErrNoRows — sentinel драйвера: запрос не вернул ни одной строки.
-		// Переводим в доменную ошибку, чтобы слой выше не зависел от pgx.
 		if errors.Is(err, pgx.ErrNoRows) {
 			return models.Order{}, models.ErrOrderNotFound
 		}
@@ -248,8 +266,6 @@ func (r *PostgresRepository) GetOrder(ctx context.Context, orderUID string) (mod
 }
 
 // GetRecentOrders загружает последние limit заказов (по date_created) для прогрева кэша при старте.
-// Всего 2 запроса при любом limit: заказы с доставкой и оплатой одним JOIN, затем все их товары разом.
-// Раньше было 1 + 4*N запросов подряд под одним таймаутом — на больших объёмах прогрев не успевал.
 func (r *PostgresRepository) GetRecentOrders(ctx context.Context, limit int) ([]models.Order, error) {
 	ctx, span := tracer.Start(ctx, "postgres.GetRecentOrders")
 	defer span.End()
@@ -257,10 +273,6 @@ func (r *PostgresRepository) GetRecentOrders(ctx context.Context, limit int) ([]
 	ctx, cancel := r.withTimeout(ctx)
 	defer cancel()
 
-	// 1. Заказы + доставка + оплата одним запросом.
-	// Связи 1:1, поэтому JOIN не размножает строки: одна строка = один заказ.
-	// ORDER BY date_created DESC LIMIT — берём самые свежие; индекс idx_orders_date_created
-	// (миграция 002) позволяет не сортировать всю таблицу.
 	rows, err := r.pool.Query(ctx, `
 		SELECT o.order_uid, o.track_number, o.entry, o.locale,
 			o.internal_signature, o.customer_id, o.delivery_service,
@@ -300,8 +312,6 @@ func (r *PostgresRepository) GetRecentOrders(ctx context.Context, limit int) ([]
 		}
 		orders = append(orders, o)
 	}
-	// rows.Err() — ошибка, случившаяся во время чтения (например, оборвалось соединение).
-	// Без этой проверки обрыв выглядел бы как «заказов меньше, чем есть».
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate recent orders: %w", err)
 	}
@@ -309,7 +319,6 @@ func (r *PostgresRepository) GetRecentOrders(ctx context.Context, limit int) ([]
 		return orders, nil
 	}
 
-	// 2. Все товары этих заказов одним запросом: order_uid = ANY($1) — «входит в массив».
 	uids := make([]string, len(orders))
 	idx := make(map[string]int, len(orders)) // order_uid -> позиция в orders
 	for i, o := range orders {

@@ -1,10 +1,5 @@
 // Package metrics — метрики Prometheus для слоёв, которые не относятся к HTTP:
 // кэш (считает сервис) и Kafka (считает консьюмер).
-//
-// Раньше эти метрики жили в пакете handler, и это мешало считать их там, где происходит событие:
-// сервис не может импортировать handler (handler сам импортирует сервис — получился бы цикл импортов),
-// а консьюмеру Kafka незачем зависеть от HTTP-слоя.
-// Пакет metrics ни от чего внутреннего не зависит, поэтому его может импортировать любой слой.
 package metrics
 
 import "github.com/prometheus/client_golang/prometheus"
@@ -42,7 +37,7 @@ func RecordCacheHit() {
 	cacheHitsTotal.Inc()
 }
 
-// RecordCacheMiss — заказа не было в кэше, пошли в БД (найден он там или нет — неважно)
+// RecordCacheMiss — заказа не было в кэше, пошли в БД
 func RecordCacheMiss() {
 	cacheMissesTotal.Inc()
 }
@@ -53,9 +48,6 @@ func RecordKafkaMessage(status string) {
 }
 
 // RegisterOrdersInCache регистрирует метрику orders_in_cache.
-// GaugeFunc вызывает size в момент, когда Prometheus забирает метрики, —
-// значение всегда актуальное, и кэшу не нужно ничего знать о Prometheus.
-// Вызывать один раз при старте: повторная регистрация вызовет панику.
 func RegisterOrdersInCache(size func() int) {
 	prometheus.MustRegister(prometheus.NewGaugeFunc(
 		prometheus.GaugeOpts{
