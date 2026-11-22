@@ -91,6 +91,7 @@ func TestHealth(t *testing.T) {
 }
 
 // Метка path в HTTP-метриках — шаблон маршрута, а не реальный путь.
+// Иначе каждый order_uid создавал бы новый временной ряд (взрыв кардинальности).
 func TestMetrics_PathLabelIsRoutePattern(t *testing.T) {
 	svc := &stubService{order: models.Order{OrderUID: "uid-for-metrics-test"}, found: true}
 	do(t, svc, http.MethodGet, "/order/uid-for-metrics-test")
