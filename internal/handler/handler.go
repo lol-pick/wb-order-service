@@ -79,7 +79,7 @@ func (h *Handler) GetOrder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 2. Ищем в кеше
+	// 2. Ищем заказ: сначала в кэше, потом в БД (попадания и промахи считает сервис)
 	order, found, err := h.service.GetOrder(ctx, orderUID)
 	if err != nil {
 		log.Printf("Error getting order: %v\n", err)
@@ -88,13 +88,11 @@ func (h *Handler) GetOrder(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if !found {
-		RecordCacheMiss()
 		respondError(w, http.StatusNotFound, "order not found")
 		return
 	}
 
 	// 3. Возвращаем JSON
-	RecordCacheHit()
 	respondJSON(w, http.StatusOK, order)
 }
 

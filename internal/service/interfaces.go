@@ -10,7 +10,7 @@ import (
 type OrderRepository interface {
 	SaveOrder(ctx context.Context, order models.Order) error
 	GetOrder(ctx context.Context, orderUID string) (models.Order, error)
-	GetAllOrders(ctx context.Context) ([]models.Order, error)
+	GetRecentOrders(ctx context.Context, limit int) ([]models.Order, error)
 	Close()
 }
 
@@ -26,5 +26,5 @@ type OrderCache interface {
 type OrderService interface {
 	SaveOrder(ctx context.Context, order models.Order) error
 	GetOrder(ctx context.Context, orderUID string) (models.Order, bool, error)
-	RestoreCache(ctx context.Context) error
+	RestoreCache(ctx context.Context, limit int) error
 }

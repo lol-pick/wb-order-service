@@ -11,17 +11,17 @@ import (
 	kafkago "github.com/segmentio/kafka-go"
 
 	"wb-order-service/internal/config"
-	"wb-order-service/internal/handler"
+	"wb-order-service/internal/metrics"
 	"wb-order-service/internal/models"
 	"wb-order-service/internal/service"
 )
 
 const (
-	// Сколько раз пробуем сохранить заказ в БД, прежде чем отправить его в DLQ
-	maxSaveAttempts = 5
 	// Начальная и максимальная пауза между повторами
 	retryBaseDelay = 200 * time.Millisecond
 	retryMaxDelay  = 5 * time.Second
+	// Сколько ждём подтверждения оффсета, если сервис уже останавливается
+	commitTimeout = 5 * time.Second
 )
 
 // Consumer - читатель сообщений из Kafka
@@ -99,7 +99,12 @@ func (c *Consumer) readAndProcess(ctx context.Context) {
 		return
 	}
 
-	if err := c.reader.CommitMessages(ctx, msg); err != nil {
+	// Заказ уже сохранён — оффсет нужно подтвердить, даже если пришёл сигнал остановки.
+	// С отменённым ctx коммит сразу упал бы, и после перезапуска сообщение пришло бы повторно.
+	// context.WithoutCancel (Go 1.21+) — копия ctx без отмены; свой таймаут, чтобы не зависнуть.
+	commitCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), commitTimeout)
+	defer cancel()
+	if err := c.reader.CommitMessages(commitCtx, msg); err != nil {
 		log.Printf("Error committing message: %v\n", err)
 	}
 }
@@ -110,31 +115,52 @@ func (c *Consumer) handle(ctx context.Context, msg kafkago.Message) error {
 	order, err := decodeOrder(msg.Value)
 	if err != nil {
 		// Битое сообщение: повторять бессмысленно, сразу в DLQ
-		handler.RecordKafkaMessage("failed")
+		metrics.RecordKafkaMessage("failed")
 		log.Printf("Invalid message: %v\n", err)
 		return c.sendToDLQ(ctx, msg, err)
 	}
 
-	err = retry(ctx, maxSaveAttempts, func() error {
-		err := c.service.SaveOrder(ctx, order)
-		if errors.Is(err, models.ErrOrderExists) {
+	// Начатую попытку сохранения доводим до конца даже при остановке сервиса:
+	// SaveOrder получает ctx без отмены (таймаут на запросы ставит репозиторий).
+	// А ожидание между повторами прерывается по ctx — новых попыток после сигнала не будет.
+	saveCtx := context.WithoutCancel(ctx)
+
+	// Ошибки делятся на два вида:
+	//   - временные (БД недоступна, таймаут) — повторяем БЕЗ ограничения, пока БД не вернётся.
+	//     DLQ для них не подходит: при упавшей БД падали бы все сообщения подряд,
+	//     и рабочие заказы оседали бы в DLQ, где их никто не переобработает;
+	//   - постоянные (ErrInvalidOrder: БД отвергла сами данные) — повтор не поможет, сразу в DLQ.
+	// Пока идут повторы, оффсет не коммитится: после перезапуска сервис продолжит с этого же сообщения.
+	var invalidErr error
+	err = retry(ctx, 0, func() error {
+		err := c.service.SaveOrder(saveCtx, order)
+		switch {
+		case err == nil:
+			return nil
+		case errors.Is(err, models.ErrOrderExists):
 			log.Printf("Order %s already exists, skipping\n", order.OrderUID)
 			return nil
+		case errors.Is(err, models.ErrInvalidOrder):
+			invalidErr = err
+			return nil // выходим из повторов, решение о DLQ — ниже
+		default:
+			metrics.RecordKafkaMessage("retry") // рост этой метрики = БД недоступна, повод для алерта
+			return err
 		}
-		return err
 	})
-	if err == nil {
-		handler.RecordKafkaMessage("processed")
+	if err != nil {
+		// retry без ограничения попыток возвращает ошибку только при отмене ctx (остановка сервиса)
+		return err
+	}
+	if invalidErr == nil {
+		metrics.RecordKafkaMessage("processed")
 		return nil
 	}
-	if ctx.Err() != nil {
-		return ctx.Err()
-	}
 
-	// БД недоступна дольше, чем длятся все повторы: откладываем сообщение в DLQ
-	handler.RecordKafkaMessage("failed")
-	log.Printf("Save failed after %d attempts: %v\n", maxSaveAttempts, err)
-	return c.sendToDLQ(ctx, msg, err)
+	// БД отвергла данные заказа: откладываем сообщение в DLQ
+	metrics.RecordKafkaMessage("failed")
+	log.Printf("Order %s rejected by DB: %v\n", order.OrderUID, invalidErr)
+	return c.sendToDLQ(ctx, msg, invalidErr)
 }
 
 // sendToDLQ повторяет отправку в DLQ, пока она не пройдёт или сервис не остановят.
@@ -146,7 +172,7 @@ func (c *Consumer) sendToDLQ(ctx context.Context, msg kafkago.Message, reason er
 	if err != nil {
 		return err
 	}
-	handler.RecordKafkaMessage("dlq")
+	metrics.RecordKafkaMessage("dlq")
 	return nil
 }
 

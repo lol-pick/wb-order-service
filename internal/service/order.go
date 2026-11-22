@@ -2,10 +2,11 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
-	"strings"
 
+	"wb-order-service/internal/metrics"
 	"wb-order-service/internal/models"
 
 	"go.opentelemetry.io/otel"
@@ -53,16 +54,20 @@ func (s *orderService) GetOrder(ctx context.Context, orderUID string) (models.Or
 	// 1. Ищем в кэше
 	order, found := s.cache.Get(orderUID)
 	if found {
+		metrics.RecordCacheHit()
 		log.Printf("Cache HIT for order %s\n", orderUID)
 		return order, true, nil
 	}
 
-	// 2. Ищем в БД
+	// 2. Ищем в БД. Промах кэша считаем здесь, до запроса:
+	// найдётся заказ в БД или нет — к эффективности кэша это не относится.
+	metrics.RecordCacheMiss()
 	log.Printf("Cache MISS for order %s, querying DB\n", orderUID)
 	order, err := s.repo.GetOrder(ctx, orderUID)
 	if err != nil {
-		// Если ошибка - "no rows" - заказ не найден
-		if strings.Contains(err.Error(), "no rows") {
+		// Заказа нет — это не ошибка сервиса, а обычный ответ «не найден» (404).
+		// errors.Is сравнивает с sentinel по всей цепочке обёрток (%w), а не по тексту.
+		if errors.Is(err, models.ErrOrderNotFound) {
 			return models.Order{}, false, nil
 		}
 		// Иначе - реальная ошибка БД
@@ -74,14 +79,20 @@ func (s *orderService) GetOrder(ctx context.Context, orderUID string) (models.Or
 	return order, true, nil
 }
 
-// RestoreCache восстанавливает кэш из БД
-func (s *orderService) RestoreCache(ctx context.Context) error {
+// RestoreCache прогревает кэш последними limit заказами из БД.
+// Грузить всё бессмысленно: запись живёт в кэше только TTL (10 минут),
+// а в первые минуты после перезапуска спрашивают в основном свежие заказы.
+func (s *orderService) RestoreCache(ctx context.Context, limit int) error {
 	ctx, span := tracer.Start(ctx, "service.RestoreCache")
 	defer span.End()
 
-	orders, err := s.repo.GetAllOrders(ctx)
+	if limit <= 0 {
+		return nil // прогрев выключен
+	}
+
+	orders, err := s.repo.GetRecentOrders(ctx, limit)
 	if err != nil {
-		return fmt.Errorf("get all orders: %w", err)
+		return fmt.Errorf("get recent orders: %w", err)
 	}
 
 	for _, order := range orders {

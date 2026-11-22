@@ -5,11 +5,12 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-// Prometheus метрики
+// HTTP-метрики. Метрики кэша и Kafka — в пакете internal/metrics.
 var (
 	httpRequestsTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
@@ -27,45 +28,12 @@ var (
 		},
 		[]string{"method", "path"},
 	)
-
-	cacheHitsTotal = prometheus.NewCounter(
-		prometheus.CounterOpts{
-			Name: "cache_hits_total",
-			Help: "Total number of cache hits",
-		},
-	)
-
-	cacheMissesTotal = prometheus.NewCounter(
-		prometheus.CounterOpts{
-			Name: "cache_misses_total",
-			Help: "Total number of cache misses",
-		},
-	)
-
-	kafkaMessagesTotal = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "kafka_messages_total",
-			Help: "Total number of Kafka messages",
-		},
-		[]string{"status"}, // "processed", "failed", "dlq"
-	)
-
-	ordersInCache = prometheus.NewGauge(
-		prometheus.GaugeOpts{
-			Name: "orders_in_cache",
-			Help: "Current number of orders in cache",
-		},
-	)
 )
 
 func init() {
 	prometheus.MustRegister(
 		httpRequestsTotal,
 		httpRequestDuration,
-		cacheHitsTotal,
-		cacheMissesTotal,
-		kafkaMessagesTotal,
-		ordersInCache,
 	)
 }
 
@@ -91,17 +59,34 @@ func metricsMiddleware(next http.Handler) http.Handler {
 
 		duration := time.Since(start).Seconds()
 
+		// В метку path пишем шаблон маршрута (/order/{order_uid}), а не реальный путь.
+		// С r.URL.Path каждый order_uid создавал бы новый временной ряд в Prometheus:
+		// миллион заказов — миллион рядов в памяти сервиса и Prometheus (взрыв кардинальности).
+		path := routePattern(r)
+
 		httpRequestsTotal.WithLabelValues(
 			r.Method,
-			r.URL.Path,
+			path,
 			strconv.Itoa(wrapped.statusCode),
 		).Inc()
 
 		httpRequestDuration.WithLabelValues(
 			r.Method,
-			r.URL.Path,
+			path,
 		).Observe(duration)
 	})
+}
+
+// routePattern возвращает шаблон маршрута chi. Читать его нужно после next.ServeHTTP:
+// chi заполняет шаблон, только когда роутер нашёл обработчик.
+// Для несуществующих путей шаблона нет — все они попадают в одну метку "unmatched".
+func routePattern(r *http.Request) string {
+	if rctx := chi.RouteContext(r.Context()); rctx != nil {
+		if p := rctx.RoutePattern(); p != "" {
+			return p
+		}
+	}
+	return "unmatched"
 }
 
 // responseWriter — обёртка для перехвата статус-кода
@@ -113,21 +98,4 @@ type responseWriter struct {
 func (rw *responseWriter) WriteHeader(code int) {
 	rw.statusCode = code
 	rw.ResponseWriter.WriteHeader(code)
-}
-
-// Функции для использования в других пакетах
-func RecordCacheHit() {
-	cacheHitsTotal.Inc()
-}
-
-func RecordCacheMiss() {
-	cacheMissesTotal.Inc()
-}
-
-func RecordKafkaMessage(status string) {
-	kafkaMessagesTotal.WithLabelValues(status).Inc()
-}
-
-func SetOrdersInCache(count int) {
-	ordersInCache.Set(float64(count))
 }

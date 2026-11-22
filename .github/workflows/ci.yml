@@ -35,7 +35,10 @@ jobs:
           go-version-file: go.mod
 
       - name: Apply migrations
-        run: psql "$TEST_POSTGRES_CONN" -f migrations/001_init.up.sql
+        run: |
+          for f in migrations/*.up.sql; do
+            psql "$TEST_POSTGRES_CONN" -v ON_ERROR_STOP=1 -f "$f"
+          done
 
       - name: Build
         run: go build ./...
