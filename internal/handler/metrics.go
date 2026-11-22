@@ -60,8 +60,6 @@ func metricsMiddleware(next http.Handler) http.Handler {
 		duration := time.Since(start).Seconds()
 
 		// В метку path пишем шаблон маршрута (/order/{order_uid}), а не реальный путь.
-		// С r.URL.Path каждый order_uid создавал бы новый временной ряд в Prometheus:
-		// миллион заказов — миллион рядов в памяти сервиса и Prometheus (взрыв кардинальности).
 		path := routePattern(r)
 
 		httpRequestsTotal.WithLabelValues(
@@ -77,9 +75,7 @@ func metricsMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// routePattern возвращает шаблон маршрута chi. Читать его нужно после next.ServeHTTP:
-// chi заполняет шаблон, только когда роутер нашёл обработчик.
-// Для несуществующих путей шаблона нет — все они попадают в одну метку "unmatched".
+// routePattern возвращает шаблон маршрута chi.
 func routePattern(r *http.Request) string {
 	if rctx := chi.RouteContext(r.Context()); rctx != nil {
 		if p := rctx.RoutePattern(); p != "" {

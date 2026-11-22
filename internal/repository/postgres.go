@@ -43,13 +43,10 @@ func (r *PostgresRepository) Close() {
 	r.pool.Close()
 }
 
-// writeErr оборачивает ошибку записи и помечает «плохие данные» sentinel-ошибкой ErrInvalidOrder.
-// Коды PostgreSQL (SQLSTATE) группируются по первым двум символам — классу:
+// writeErr оборачивает ошибку записи
+// Коды PostgreSQL группируются по первым двум символам — классу:
 //   - 22 (data exception) — значение не подходит под тип: строка длиннее varchar(N), переполнение числа;
 //   - 23 (integrity constraint violation) — нарушено ограничение: NOT NULL, CHECK, внешний ключ.
-//
-// Такие ошибки повторять бессмысленно. Всё остальное (нет соединения, таймаут, БД перезапускается)
-// считается временным, и консьюмер будет повторять, пока БД не вернётся.
 func writeErr(op string, err error) error {
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) && len(pgErr.Code) == 5 {
@@ -85,8 +82,6 @@ func (r *PostgresRepository) SaveOrder(ctx context.Context, order models.Order) 
 
 	// Все вставки отправляем ОДНИМ пакетом (pgx.Batch): pgx пишет запросы в соединение подряд,
 	// не дожидаясь ответа на каждый (pipelining), и читает ответы потом.
-	// Раньше было 3 + len(items) отдельных запросов — каждый ждал ответа БД (round trip).
-	// Теперь на заказ 3 обмена с БД при любом числе товаров: BEGIN, пакет, COMMIT.
 	batch := &pgx.Batch{}
 
 	// 1. orders
@@ -152,11 +147,8 @@ func (r *PostgresRepository) SaveOrder(ctx context.Context, order models.Order) 
 }
 
 // execBatch отправляет пакет и читает результаты строго по порядку постановки в очередь.
-// Первый запрос — вставка в orders: её unique_violation означает дубль заказа.
 func execBatch(ctx context.Context, tx pgx.Tx, batch *pgx.Batch) error {
 	br := tx.SendBatch(ctx, batch)
-	// Close обязателен до следующего запроса в этой транзакции (иначе «conn busy»).
-	// Ошибку Close игнорируем: первую ошибку пакета мы уже вернём из цикла ниже.
 	defer func() { _ = br.Close() }()
 
 	for i := 0; i < batch.Len(); i++ {
@@ -208,8 +200,6 @@ func (r *PostgresRepository) GetOrder(ctx context.Context, orderUID string) (mod
 		&order.ShardKey, &order.SmID, &order.DateCreated, &order.OofShard,
 	)
 	if err != nil {
-		// pgx.ErrNoRows — sentinel драйвера: запрос не вернул ни одной строки.
-		// Переводим в доменную ошибку, чтобы слой выше не зависел от pgx.
 		if errors.Is(err, pgx.ErrNoRows) {
 			return models.Order{}, models.ErrOrderNotFound
 		}
@@ -276,8 +266,6 @@ func (r *PostgresRepository) GetOrder(ctx context.Context, orderUID string) (mod
 }
 
 // GetRecentOrders загружает последние limit заказов (по date_created) для прогрева кэша при старте.
-// Всего 2 запроса при любом limit: заказы с доставкой и оплатой одним JOIN, затем все их товары разом.
-// Раньше было 1 + 4*N запросов подряд под одним таймаутом — на больших объёмах прогрев не успевал.
 func (r *PostgresRepository) GetRecentOrders(ctx context.Context, limit int) ([]models.Order, error) {
 	ctx, span := tracer.Start(ctx, "postgres.GetRecentOrders")
 	defer span.End()
@@ -285,10 +273,6 @@ func (r *PostgresRepository) GetRecentOrders(ctx context.Context, limit int) ([]
 	ctx, cancel := r.withTimeout(ctx)
 	defer cancel()
 
-	// 1. Заказы + доставка + оплата одним запросом.
-	// Связи 1:1, поэтому JOIN не размножает строки: одна строка = один заказ.
-	// ORDER BY date_created DESC LIMIT — берём самые свежие; индекс idx_orders_date_created
-	// (миграция 002) позволяет не сортировать всю таблицу.
 	rows, err := r.pool.Query(ctx, `
 		SELECT o.order_uid, o.track_number, o.entry, o.locale,
 			o.internal_signature, o.customer_id, o.delivery_service,
@@ -328,8 +312,6 @@ func (r *PostgresRepository) GetRecentOrders(ctx context.Context, limit int) ([]
 		}
 		orders = append(orders, o)
 	}
-	// rows.Err() — ошибка, случившаяся во время чтения (например, оборвалось соединение).
-	// Без этой проверки обрыв выглядел бы как «заказов меньше, чем есть».
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate recent orders: %w", err)
 	}
@@ -337,7 +319,6 @@ func (r *PostgresRepository) GetRecentOrders(ctx context.Context, limit int) ([]
 		return orders, nil
 	}
 
-	// 2. Все товары этих заказов одним запросом: order_uid = ANY($1) — «входит в массив».
 	uids := make([]string, len(orders))
 	idx := make(map[string]int, len(orders)) // order_uid -> позиция в orders
 	for i, o := range orders {

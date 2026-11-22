@@ -32,7 +32,7 @@ func (h *Handler) NewRouter() *chi.Mux {
 
 	// Middleware
 	r.Use(skipPathLogger("/metrics"))
-	r.Use(middleware.Recoverer) // Ловит паники, не дает серверу упасть
+	r.Use(middleware.Recoverer)
 	r.Use(metricsMiddleware)
 
 	// Маршруты

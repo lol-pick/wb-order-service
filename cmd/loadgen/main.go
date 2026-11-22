@@ -1,9 +1,6 @@
 // loadgen — инструменты для замеров сервиса: нагрузка на Kafka, наполнение БД,
 // время старта и выгрузка order_uid для k6.
 //
-// Не трогает код сервиса, поэтому одинаково работает на main («до») и на ветке с изменениями («после»).
-// Настройки Kafka и PostgreSQL берёт из тех же переменных окружения (.env), что и сервис.
-//
 //	go run ./cmd/loadgen produce -n 10000      // пропускная способность консьюмера
 //	go run ./cmd/loadgen seed -n 100000        // наполнить БД для замера старта
 //	go run ./cmd/loadgen startup -bin ./bin/service
@@ -80,9 +77,6 @@ commands:
 // ---------- produce ----------
 
 // runProduce шлёт N заказов в топик и ждёт, пока все появятся в БД.
-// Пропускная способность = N / (время от начала отправки до последнего заказа в БД).
-// Отправка батчами занимает доли секунды, консьюмер гораздо медленнее,
-// поэтому результат почти целиком — скорость консьюмера.
 func runProduce(cfg *config.Config, args []string) error {
 	fs := flag.NewFlagSet("produce", flag.ExitOnError)
 	n := fs.Int("n", 10000, "сколько заказов отправить")
@@ -284,8 +278,7 @@ func generateOrder(uid string, itemsCount int) map[string]any {
 
 // ---------- seed ----------
 
-// runSeed вставляет N заказов прямо в БД одним INSERT ... SELECT FROM generate_series на таблицу.
-// Через Kafka 100 000 заказов шли бы долго, а для замера старта важны только данные в БД.
+// runSeed вставляет N заказов в БД
 func runSeed(cfg *config.Config, args []string) error {
 	fs := flag.NewFlagSet("seed", flag.ExitOnError)
 	n := fs.Int("n", 100000, "сколько заказов вставить")
@@ -394,8 +387,7 @@ func runStartup(args []string) error {
 	return errors.New("service did not become ready before timeout")
 }
 
-// stopProcess останавливает сервис: на Linux/macOS — SIGINT (graceful shutdown),
-// на Windows сигналы процессу не отправить, поэтому Kill.
+// stopProcess останавливает сервис
 func stopProcess(cmd *exec.Cmd) {
 	if runtime.GOOS == "windows" {
 		_ = cmd.Process.Kill()

@@ -99,7 +99,6 @@ func validMessage() kafkago.Message {
 }
 
 // Временная ошибка БД: повторяем до успеха, в DLQ не отправляем
-// (dlq == nil: обращение к DLQ уронило бы тест паникой)
 func TestHandle_TransientErrorRetriesUntilSuccess(t *testing.T) {
 	svc := &stubService{failures: 2, saveErr: errors.New("connection refused")}
 	c := &Consumer{service: svc}

@@ -63,9 +63,7 @@ type TracingConfig struct {
 }
 
 // ConnString возвращает строку подключения к PostgreSQL.
-// Собираем через net/url: логин и пароль экранируются. С простым Sprintf пароль
-// со спецсимволами (@, :, /) ломал бы разбор строки — например, «@» в пароле
-// драйвер принял бы за начало адреса хоста.
+// Собираем через net/url: логин и пароль экранируются.
 func (p PostgresConfig) ConnString() string {
 	u := url.URL{
 		Scheme: "postgres",

@@ -7,7 +7,6 @@ import (
 )
 
 // clearEnv убирает переменные на время теста и возвращает прежние значения после него.
-// t.Setenv(key, "") не подходит: getEnv различает «не задана» и «задана пустой».
 func clearEnv(t *testing.T, keys ...string) {
 	t.Helper()
 	for _, key := range keys {
@@ -72,7 +71,6 @@ func TestLoad_EnvOverrides(t *testing.T) {
 }
 
 // Некорректное число или длительность молча заменяются значением по умолчанию.
-// Тест фиксирует текущее поведение: CACHE_TTL=10 (без единиц) — это НЕ 10 минут, а значение по умолчанию.
 func TestLoad_InvalidValueFallsBackToDefault(t *testing.T) {
 	clearEnv(t, allKeys...)
 	t.Setenv("CACHE_MAX_SIZE", "many")

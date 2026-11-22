@@ -226,11 +226,6 @@ func TestPostgres_GetRecentOrders(t *testing.T) {
 	}
 	defer repo.Close()
 
-	// Три заказа «из будущего», которые должны оказаться новее всего в тестовой БД.
-	// Тестовая БД не очищается между запусками, поэтому заказы прошлых прогонов остаются.
-	// Шаг между нашими заказами — 1 мс, а не часы: тогда заказы прошлого прогона
-	// (у них меньше base) всегда старше заказов текущего, даже если прогоны идут подряд.
-	// Раньше шаг был 1 час: заказ «+3ч» прогона минутной давности оказывался новее нашего «+2ч».
 	base := time.Now().UTC().Add(1000 * time.Hour).Truncate(time.Microsecond)
 	var saved []models.Order
 	for i := 1; i <= 3; i++ {
@@ -254,7 +249,6 @@ func TestPostgres_GetRecentOrders(t *testing.T) {
 	if orders[0].OrderUID != saved[2].OrderUID || orders[1].OrderUID != saved[1].OrderUID {
 		t.Errorf("Unexpected order: got %s, %s", orders[0].OrderUID, orders[1].OrderUID)
 	}
-	// Товары подтянулись вторым запросом
 	if len(orders[0].Items) != len(saved[2].Items) {
 		t.Errorf("Expected %d items, got %d", len(saved[2].Items), len(orders[0].Items))
 	}
